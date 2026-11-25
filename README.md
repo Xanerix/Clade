@@ -47,11 +47,11 @@ bun install
 # 仅前端类型检查与打包
 bun run build
 
-# Release 构建（产出 src-tauri/target/release/clade-gui.exe 和 clade.exe）
-bun run tauri build --no-bundle
+# Release 构建（产出 NSIS / MSI 安装包，自动附带同目录 clade.exe；纯可执行文件可用 --no-bundle）
+bun run tauri build
 ```
 
-> `clade-gui.exe`（GUI，Windows 子系统）与 `clade.exe`（控制台启动器）**必须位于同一目录**。
+> `clade-gui.exe`（GUI，Windows 子系统）与 `clade.exe`（控制台启动器）**必须位于同一目录**。安装包会自动将两者装到同一目录；绿色便携包请保持两文件同目录存放。
 
 ## 命令行用法
 
@@ -105,4 +105,4 @@ cargo test --test smoke -- --include-ignored --test-threads=1
 
 - 本项目部分能力依赖 Claude Code 的**未公开内部环境变量或本地缓存结构**（例如 `CLAUDE_SECURESTORAGE_CONFIG_DIR`、`CLAUDE_CODE_REMOTE_MEMORY_DIR`、`.claude.json` 中的 `cachedUsageUtilization`、`sessions/` 跨会话池等），均在实测版本上验证通过，但随 Claude Code 升级可能发生变更或失效。
 - OpenAI 登录卡与 Antigravity 登录卡通过对应客户端的公开 OAuth 流程与接口工作，请遵守各服务商的使用条款，自行承担使用风险。
-- 打包安装程序尚未制作，当前请直接构建并将 `clade-gui.exe` 与 `clade.exe` 放在同一目录使用。
+- 安装包未做代码签名，Windows SmartScreen 首次运行可能弹窗提醒；也可直接从源码自行构建。
