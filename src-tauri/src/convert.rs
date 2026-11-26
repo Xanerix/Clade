@@ -172,6 +172,51 @@ fn tool_result_content_to_string(content: Option<&Value>) -> String {
     }
 }
 
+/// 拆分 tool_result 的 content：遇到 Anthropic image 块时提取出来由调用方转成对应协议的图片结构，
+/// 避免整段 base64 被当成纯文本 JSON 序列化撑爆上下文。无图片时返回原文本和空图片列表。
+fn split_tool_result_images<F>(content: Option<&Value>, mut convert_img: F) -> (String, Vec<Value>)
+where
+    F: FnMut(&Value) -> Option<Value>,
+{
+    let Some(Value::Array(arr)) = content else {
+        return (tool_result_content_to_string(content), Vec::new());
+    };
+    if !arr.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("image")) {
+        return (tool_result_content_to_string(content), Vec::new());
+    }
+
+    let mut texts = Vec::new();
+    let mut images = Vec::new();
+    for block in arr {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    texts.push(t.to_string());
+                }
+            }
+            Some("image") => {
+                if let Some(img) = convert_img(block) {
+                    images.push(img);
+                }
+            }
+            _ => {
+                if let Ok(s) = serde_json::to_string(block) {
+                    texts.push(s);
+                }
+            }
+        }
+    }
+    if images.is_empty() {
+        return (tool_result_content_to_string(content), Vec::new());
+    }
+    let text = if texts.is_empty() {
+        "[tool result image attached]".to_string()
+    } else {
+        texts.join("\n")
+    };
+    (text, images)
+}
+
 /// 转换单条 Anthropic 消息为一条或多条 OpenAI Chat 消息。
 fn convert_message(msg: &Value) -> Vec<Value> {
     let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -190,6 +235,7 @@ fn convert_message(msg: &Value) -> Vec<Value> {
     let mut out = Vec::new();
     let mut parts = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut tool_media_parts = Vec::new();
 
     for block in blocks {
         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
@@ -220,17 +266,32 @@ fn convert_message(msg: &Value) -> Vec<Value> {
             }
             "tool_result" => {
                 let tool_call_id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                let content_str = tool_result_content_to_string(block.get("content"));
+                let (content_str, images) = split_tool_result_images(block.get("content"), convert_image_block);
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": content_str,
                 }));
+                if !images.is_empty() {
+                    tool_media_parts.push(json!({
+                        "type": "text",
+                        "text": format!("[media output of tool call {tool_call_id}]"),
+                    }));
+                    tool_media_parts.extend(images);
+                }
             }
             // thinking / redacted_thinking 在请求里直接丢弃
             "thinking" | "redacted_thinking" => {}
             _ => {}
         }
+    }
+
+    // OpenAI Chat 的 role: tool 不能携带图片，在全部并列 tool 消息后追加一条 user 消息承载提取出的图片
+    if !tool_media_parts.is_empty() {
+        out.push(json!({
+            "role": "user",
+            "content": tool_media_parts,
+        }));
     }
 
     if !parts.is_empty() || !tool_calls.is_empty() {
@@ -996,6 +1057,44 @@ fn convert_image_block_responses(block: &Value) -> Option<Value> {
     Some(json!({ "type": "input_image", "image_url": url }))
 }
 
+/// 将 tool_result 的 content 转为 Responses API 的 function_call_output.output：
+/// 含图片时返回 input_text / input_image 数组，无图片时沿用纯字符串。
+fn tool_result_to_responses_output(content: Option<&Value>) -> Value {
+    let Some(Value::Array(arr)) = content else {
+        return json!(tool_result_content_to_string(content));
+    };
+    if !arr.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("image")) {
+        return json!(tool_result_content_to_string(content));
+    }
+    let mut items = Vec::new();
+    let mut has_image = false;
+    for block in arr {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    items.push(json!({ "type": "input_text", "text": t }));
+                }
+            }
+            Some("image") => {
+                if let Some(img) = convert_image_block_responses(block) {
+                    has_image = true;
+                    items.push(img);
+                }
+            }
+            _ => {
+                if let Ok(s) = serde_json::to_string(block) {
+                    items.push(json!({ "type": "input_text", "text": s }));
+                }
+            }
+        }
+    }
+    if has_image {
+        Value::Array(items)
+    } else {
+        json!(tool_result_content_to_string(content))
+    }
+}
+
 fn map_tool_choice_responses(tc: &Value) -> Option<Value> {
     match tc {
         Value::String(s) => match s.as_str() {
@@ -1128,7 +1227,7 @@ pub fn anthropic_to_openai_responses(body: &Value) -> Result<Value> {
                                     input.push(json!({ "role": role, "content": std::mem::take(&mut parts) }));
                                 }
                                 let call_id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                                let output = tool_result_content_to_string(block.get("content"));
+                                let output = tool_result_to_responses_output(block.get("content"));
                                 input.push(json!({
                                     "type": "function_call_output",
                                     "call_id": call_id,
@@ -2174,9 +2273,24 @@ fn fill_gemini_skip_thought_signatures(contents: &mut [Value]) {
     }
 }
 
+/// 转换 Anthropic image 内容块 → Gemini inlineData part。
+fn convert_image_block_gemini(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return None;
+    }
+    let mime = source.get("media_type").and_then(Value::as_str).unwrap_or("image/png");
+    let data = source.get("data").and_then(Value::as_str).filter(|d| !d.is_empty())?;
+    Some(json!({ "inlineData": { "mimeType": mime, "data": data } }))
+}
+
 /// Anthropic Messages 请求体 → Google Gemini Native `generateContent` 请求体。
 pub fn anthropic_to_gemini(body: &Value) -> Result<Value> {
     let mut result = Map::new();
+    let supports_multimodal_fr = body
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(requires_gemini_thought_signature);
 
     // system → systemInstruction
     if let Some(system) = body.get("system") {
@@ -2239,14 +2353,8 @@ pub fn anthropic_to_gemini(body: &Value) -> Result<Value> {
                                 }
                             }
                             "image" => {
-                                if let Some(source) = block.get("source")
-                                    && source.get("type").and_then(Value::as_str) == Some("base64")
-                                {
-                                    let mime = source.get("media_type").and_then(Value::as_str).unwrap_or("image/png");
-                                    let data = source.get("data").and_then(Value::as_str).unwrap_or("");
-                                    if !data.is_empty() {
-                                        parts.push(json!({ "inlineData": { "mimeType": mime, "data": data } }));
-                                    }
+                                if let Some(img) = convert_image_block_gemini(block) {
+                                    parts.push(img);
                                 }
                             }
                             "tool_use" => {
@@ -2265,7 +2373,8 @@ pub fn anthropic_to_gemini(body: &Value) -> Result<Value> {
                                     .get(tool_use_id)
                                     .cloned()
                                     .unwrap_or_else(|| "unknown_tool".to_string());
-                                let content_str = tool_result_content_to_string(block.get("content"));
+                                let (content_str, media_parts) =
+                                    split_tool_result_images(block.get("content"), convert_image_block_gemini);
                                 let mut fr = json!({
                                     "name": name,
                                     "response": { "content": content_str }
@@ -2273,7 +2382,18 @@ pub fn anthropic_to_gemini(body: &Value) -> Result<Value> {
                                 if !tool_use_id.is_empty() && !is_synth_gemini_tool_id(tool_use_id) {
                                     fr["id"] = json!(tool_use_id);
                                 }
-                                parts.push(json!({ "functionResponse": fr }));
+                                if supports_multimodal_fr && !media_parts.is_empty() {
+                                    fr["parts"] = Value::Array(media_parts);
+                                    parts.push(json!({ "functionResponse": fr }));
+                                } else {
+                                    parts.push(json!({ "functionResponse": fr }));
+                                    if !media_parts.is_empty() {
+                                        parts.push(json!({
+                                            "text": format!("[media output of tool call {tool_use_id}]")
+                                        }));
+                                        parts.extend(media_parts);
+                                    }
+                                }
                             }
                             "thinking" | "redacted_thinking" => {}
                             _ => {}
@@ -3844,5 +3964,119 @@ mod tests {
         assert!(raw.contains("event: ping\ndata: {\"type\":\"ping\"}\n\n"), "{raw}");
         assert!(raw.contains("\"text\":\"ok\""), "{raw}");
         assert!(raw.contains("event: message_stop"), "{raw}");
+    }
+
+    #[test]
+    fn tool_result_images_extracted_across_protocols() {
+        let base_messages = json!([
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "call_img_1", "name": "Read", "input": {"file_path": "a.png"}},
+                    {"type": "tool_use", "id": "call_img_2", "name": "Read", "input": {"file_path": "b.png"}}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_img_1",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "IMG_DATA_1"}}
+                        ]
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_img_2",
+                        "content": [
+                            {"type": "text", "text": "说明文字"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "IMG_DATA_2"}}
+                        ]
+                    }
+                ]
+            }
+        ]);
+
+        // 1. Gemini 3+/4（含 Antigravity）：图片进入 functionResponse.parts，不序列化进 response.content
+        let g4 = anthropic_to_gemini(&json!({
+            "model": "gemini-4-neon-high",
+            "messages": base_messages
+        }))
+        .unwrap();
+        let g4_contents = g4["contents"].as_array().unwrap();
+        assert_eq!(g4_contents.len(), 2);
+        let frs = g4_contents[1]["parts"].as_array().unwrap();
+        assert_eq!(frs.len(), 2);
+        assert_eq!(frs[0]["functionResponse"]["response"]["content"], "[tool result image attached]");
+        assert_eq!(
+            frs[0]["functionResponse"]["parts"],
+            json!([{"inlineData": {"mimeType": "image/png", "data": "IMG_DATA_1"}}])
+        );
+        assert_eq!(frs[1]["functionResponse"]["response"]["content"], "说明文字");
+        assert_eq!(
+            frs[1]["functionResponse"]["parts"],
+            json!([{"inlineData": {"mimeType": "image/jpeg", "data": "IMG_DATA_2"}}])
+        );
+
+        // 2. Gemini 2.x：functionResponse 不放 parts，图片拆到紧随其后的 user content
+        let g2 = anthropic_to_gemini(&json!({
+            "model": "gemini-2.5-pro",
+            "messages": base_messages
+        }))
+        .unwrap();
+        let g2_contents = g2["contents"].as_array().unwrap();
+        assert_eq!(g2_contents.len(), 3);
+        assert!(g2_contents[1]["parts"][0]["functionResponse"].get("parts").is_none());
+        assert!(!g2_contents[1]["parts"][0]["functionResponse"]["response"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("IMG_DATA_1"));
+        assert_eq!(
+            g2_contents[2]["parts"][1],
+            json!({"inlineData": {"mimeType": "image/png", "data": "IMG_DATA_1"}})
+        );
+        assert_eq!(
+            g2_contents[2]["parts"][3],
+            json!({"inlineData": {"mimeType": "image/jpeg", "data": "IMG_DATA_2"}})
+        );
+
+        // 3. OpenAI Responses / Codex OAuth：output 为 input_text / input_image 数组
+        let resp = anthropic_to_openai_responses(&json!({
+            "model": "gpt-5.4",
+            "messages": base_messages
+        }))
+        .unwrap();
+        let input = resp["input"].as_array().unwrap();
+        assert_eq!(
+            input[2]["output"],
+            json!([{"type": "input_image", "image_url": "data:image/png;base64,IMG_DATA_1"}])
+        );
+        assert_eq!(
+            input[3]["output"],
+            json!([
+                {"type": "input_text", "text": "说明文字"},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,IMG_DATA_2"}
+            ])
+        );
+
+        // 4. OpenAI Chat：tool 消息仅留文本，图片集中放到紧随其后的 user 消息
+        let chat = anthropic_to_openai_chat(&json!({
+            "model": "gpt-4o",
+            "messages": base_messages
+        }))
+        .unwrap();
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs[1], json!({"role": "tool", "tool_call_id": "call_img_1", "content": "[tool result image attached]"}));
+        assert_eq!(msgs[2], json!({"role": "tool", "tool_call_id": "call_img_2", "content": "说明文字"}));
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(
+            msgs[3]["content"][1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,IMG_DATA_1"}})
+        );
+        assert_eq!(
+            msgs[3]["content"][3],
+            json!({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,IMG_DATA_2"}})
+        );
     }
 }
