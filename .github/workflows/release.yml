@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: '标记为预发布版本 (Pre-release)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from tauri.conf.json
+        id: meta
+        shell: pwsh
+        run: |
+          $conf = Get-Content -Raw -Path "src-tauri/tauri.conf.json" | ConvertFrom-Json
+          $version = $conf.version
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "src-tauri/tauri.conf.json 缺少有效的 version 字段"
+          }
+          $tag = "v$version"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release version: $version (tag: $tag)"
+
+      - name: Check existing release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          gh release view "$env:TAG" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:TAG 已存在，请先更新版本号或删除旧 Release"
+          }
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build Tauri installers
+        run: bun run tauri build
+
+      - name: Package portable zip & collect artifacts
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $outDir = "release-artifacts"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $nsis = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -File
+          $msi  = Get-ChildItem -Path "src-tauri/target/release/bundle/msi"  -Filter "*.msi" -File
+          if (-not $nsis -or -not $msi) {
+            throw "未找到预期的 NSIS (.exe) 或 MSI (.msi) 安装包"
+          }
+          Copy-Item $nsis.FullName, $msi.FullName -Destination $outDir
+
+          $portableStage = Join-Path $env:RUNNER_TEMP "clade-portable"
+          Remove-Item -Recurse -Force $portableStage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $portableStage | Out-Null
+          Copy-Item "src-tauri/target/release/clade-gui.exe", "src-tauri/target/release/clade.exe" -Destination $portableStage
+
+          $zipPath = Join-Path $outDir "clade_$($env:VERSION)_x64_portable.zip"
+          Compress-Archive -Path "$portableStage/*" -DestinationPath $zipPath -Force
+
+          Get-ChildItem $outDir | Format-Table Name, Length -AutoSize
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          COMMIT_SHA: ${{ github.sha }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $files = (Get-ChildItem -Path "release-artifacts" -File).FullName
+          $argsList = @(
+            "release", "create", $env:TAG,
+            "--target", $env:COMMIT_SHA,
+            "--title", $env:TAG,
+            "--generate-notes"
+          )
+          if ($env:IS_PRERELEASE -eq "true") {
+            $argsList += "--prerelease"
+          }
+          $argsList += $files
+          & gh @argsList
+          if ($LASTEXITCODE -ne 0) {
+            throw "创建 GitHub Release 失败"
+          }
