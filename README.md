@@ -4,6 +4,9 @@ Windows 专用的 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 
 
 核心隔离方式：**每个环境对应一个独立的 `CLAUDE_CONFIG_DIR`**（`~/.clade/Agents/<name>`），避免反复改写全局 `~/.claude/settings.json`，支持多账号 / 多协议模型并行运行，并内置本地聚合网关与可视化管理界面。
 
+> [!WARNING]
+> 目前无法保证Antigravity服务不会封禁，项目作者目前已稳定使用3天
+
 ## 功能特性
 
 - **多类型模型卡（多环境共用）**
@@ -33,27 +36,10 @@ Windows 专用的 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 
 - **操作系统**：Windows 10 / 11
 - **Claude Code CLI**：已安装 `claude` 并可在 `PATH` 中调用
 - **PowerShell 7 (`pwsh`)**：GUI 启动会话仅支持 PowerShell 7（未安装时会在界面引导通过 `winget` 安装或前往下载）
-- **从源码构建额外需要**：[Rust 工具链](https://rustup.rs/)（2024 edition）与 [Bun](https://bun.sh/)
 
-## 构建与运行
+## 安装与命令行用法
 
-```powershell
-# 安装前端依赖
-bun install
-
-# 开发运行（在 pwsh7 中执行：先构建 clade.exe，再启动 tauri dev）
-.\dev.ps1
-
-# 仅前端类型检查与打包
-bun run build
-
-# Release 构建（产出 NSIS / MSI 安装包，自动附带同目录 clade.exe；纯可执行文件可用 --no-bundle）
-bun run tauri build
-```
-
-> `clade-gui.exe`（GUI，Windows 子系统）与 `clade.exe`（控制台启动器）**必须位于同一目录**。安装包会自动将两者装到同一目录；绿色便携包请保持两文件同目录存放。
-
-## 命令行用法
+可从 Releases 下载安装版（NSIS / MSI）或便携版 zip。`clade-gui.exe`（GUI）与 `clade.exe`（控制台启动器）**必须位于同一目录**（安装包会自动处理，便携版解压后保持同目录即可）。
 
 在 GUI 的「设置 → 环境工具」里点击「添加到 PATH」，新开终端后即可直接使用：
 
@@ -85,24 +71,8 @@ clade <profile> [claude 参数...]  # 在当前工作目录启动指定环境
 - 第三方 API Key：`card:<卡 id>`
 - OpenAI / Antigravity OAuth 凭据：`oauth:<卡 id>`（超长自动分片为 `oauth:<卡 id>:<idx>`）
 
-## 测试
-
-```powershell
-cd src-tauri
-
-# 后端单元测试（协议转换、OAuth、Antigravity 等，不碰本机数据）
-cargo test --lib
-
-# 聚合网关集成测试（本机假上游，不碰真实数据）
-cargo test --test gateway
-
-# 端到端 smoke 测试（会读写真实 ~/.clade 与凭据管理器，仅使用 zz- 前缀并自动还原/清理；
-# 其中 usage_global 用例要求 ~/.claude 已登录官方订阅账号）
-cargo test --test smoke -- --include-ignored --test-threads=1
-```
-
 ## 注意事项与免责声明
 
 - 本项目部分能力依赖 Claude Code 的**未公开内部环境变量或本地缓存结构**（例如 `CLAUDE_SECURESTORAGE_CONFIG_DIR`、`CLAUDE_CODE_REMOTE_MEMORY_DIR`、`.claude.json` 中的 `cachedUsageUtilization`、`sessions/` 跨会话池等），均在实测版本上验证通过，但随 Claude Code 升级可能发生变更或失效。
 - OpenAI 登录卡与 Antigravity 登录卡通过对应客户端的公开 OAuth 流程与接口工作，请遵守各服务商的使用条款，自行承担使用风险。
-- 安装包未做代码签名，Windows SmartScreen 首次运行可能弹窗提醒；也可直接从源码自行构建。
+- 安装包未做代码签名，Windows SmartScreen 首次运行可能弹窗提醒；也可参考 [DEVELOPMENT.md](DEVELOPMENT.md) 从源码自行构建。
