@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useRef } from "react";
+import { memo, useEffect, useId, useLayoutEffect, useRef, type RefObject } from "react";
 import { AnimatePresence, usePresence, useReducedMotion } from "motion/react";
 
 export type BackdropView = "launch" | "profiles" | "cards" | "global";
@@ -1065,8 +1065,614 @@ function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
   );
 }
 
+/* =========================================================================
+ * 设置页（Global）：右下角博朗实心圆齿级数啮合齿轮组 (18:8 = 2.25:1)
+ * - 入场：大小轮按精确模数同频旋转并沿连心线靠拢咬合落位
+ * - 常驻：持续轻缓 2.25:1 反向真啮合运转（窗口最小化自动暂停）
+ * - 退场：同步啮合加速并绕各自轴心原地旋缩至消失
+ * ========================================================================= */
+const GEARS_ENTER_DURATION_MS = 680;
+const GEARS_EXIT_DURATION_MS = 300;
+const GEARS_IDLE_DEG_PER_SEC = -6.5;
+const GEARS_DEG_TO_RAD = Math.PI / 180;
+
+const BRAUN_GEAR_SPEC = {
+  z1: 18,
+  z2: 8,
+  m: 10.4,
+  c1x: 162,
+  c1y: 164,
+  meshAngDeg: -134,
+  backlash: 0.24,
+} as const;
+
+function buildInvoluteGearPath(
+  z: number,
+  m: number,
+  opts: { addendum: number; dedendum: number; rootDuty: number; tipDuty: number; roundTip: number },
+): string {
+  const { addendum, dedendum, rootDuty, tipDuty, roundTip } = opts;
+  const rPitch = (m * z) / 2;
+  const rOuter = rPitch + addendum * m;
+  const rRoot = Math.max(m * 1.4, rPitch - dedendum * m);
+  const step = (Math.PI * 2) / z;
+  const pt = (r: number, a: number) => `${(r * Math.cos(a)).toFixed(2)} ${(r * Math.sin(a)).toFixed(2)}`;
+
+  const rFlank = rRoot + (rOuter - rRoot) * 0.56;
+  const flankDuty = rootDuty * 0.42 + tipDuty * 0.58;
+  const tipChamferR = rOuter - (rOuter - rPitch) * roundTip;
+  const tipCornerDuty = tipDuty * 0.72;
+
+  const cmds: string[] = [];
+  for (let i = 0; i < z; i++) {
+    const aC = i * step;
+    const aNextRoot = (i + 1) * step - step * rootDuty;
+    const aRootL = aC - step * rootDuty;
+    const aFlankL = aC - step * flankDuty;
+    const aTipOuterL = aC - step * tipDuty;
+    const aTipTopL = aC - step * tipCornerDuty;
+    const aTipTopR = aC + step * tipCornerDuty;
+    const aTipOuterR = aC + step * tipDuty;
+    const aFlankR = aC + step * flankDuty;
+    const aRootR = aC + step * rootDuty;
+
+    if (i === 0) cmds.push(`M ${pt(rRoot, aRootL)}`);
+    cmds.push(`Q ${pt(rFlank, aFlankL)} ${pt(tipChamferR, aTipOuterL)}`);
+    cmds.push(`Q ${pt(rOuter, aTipTopL)} ${pt(rOuter, aC)}`);
+    cmds.push(`Q ${pt(rOuter, aTipTopR)} ${pt(tipChamferR, aTipOuterR)}`);
+    cmds.push(`Q ${pt(rFlank, aFlankR)} ${pt(rRoot, aRootR)}`);
+    cmds.push(`A ${rRoot.toFixed(2)} ${rRoot.toFixed(2)} 0 0 1 ${pt(rRoot, aNextRoot)}`);
+  }
+  cmds.push("Z");
+  return cmds.join(" ");
+}
+
+const BRAUN_GEAR_GEOM = (() => {
+  const { z1, z2, m, c1x, c1y, meshAngDeg, backlash } = BRAUN_GEAR_SPEC;
+  const r1 = (m * z1) / 2;
+  const r2 = (m * z2) / 2;
+  const dist = r1 + r2 + backlash * m;
+  const rad = meshAngDeg * GEARS_DEG_TO_RAD;
+  const ux = Math.cos(rad);
+  const uy = Math.sin(rad);
+  const c2x = c1x + dist * ux;
+  const c2y = c1y + dist * uy;
+  const base1 = meshAngDeg;
+  const base2 = meshAngDeg + 180 + 180 / z2;
+  const ratio = z1 / z2;
+  const toothOpts = { addendum: 0.82, dedendum: 1.04, rootDuty: 0.3, tipDuty: 0.16, roundTip: 0.32 };
+  const d1 = buildInvoluteGearPath(z1, m, toothOpts);
+  const d2 = buildInvoluteGearPath(z2, m, toothOpts);
+  return { c1x, c1y, c2x, c2y, ux, uy, base1, base2, ratio, d1, d2 };
+})();
+
+interface GearsSnapshot {
+  fade: number;
+  driveDeg: number;
+  x1: number;
+  y1: number;
+  s1: number;
+  x2: number;
+  y2: number;
+  s2: number;
+}
+
+function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
+  const [isPresent, safeToRemove] = usePresence();
+  const reducedMotion = useReducedMotion();
+  const maskUid = useId().replace(/:/g, "");
+  const mask1Id = `gear-braun-m1-${maskUid}`;
+  const mask2Id = `gear-braun-m2-${maskUid}`;
+
+  const layerRef = useRef<SVGGElement | null>(null);
+  const g1WrapRef = useRef<SVGGElement | null>(null);
+  const g1SpinRef = useRef<SVGGElement | null>(null);
+  const g2WrapRef = useRef<SVGGElement | null>(null);
+  const g2SpinRef = useRef<SVGGElement | null>(null);
+
+  const enterDelayRef = useRef(enterDelayMs);
+  enterDelayRef.current = enterDelayMs;
+  const safeToRemoveRef = useRef(safeToRemove);
+  safeToRemoveRef.current = safeToRemove;
+
+  const snapRef = useRef<GearsSnapshot>({
+    fade: 0,
+    driveDeg: 36,
+    x1: BRAUN_GEAR_GEOM.c1x + 18,
+    y1: BRAUN_GEAR_GEOM.c1y + 18,
+    s1: 0.84,
+    x2: BRAUN_GEAR_GEOM.c2x + 14 + BRAUN_GEAR_GEOM.ux * 14,
+    y2: BRAUN_GEAR_GEOM.c2y + 14 + BRAUN_GEAR_GEOM.uy * 14,
+    s2: 0.76,
+  });
+
+  const applyFrame = (s: GearsSnapshot) => {
+    snapRef.current = s;
+    const { base1, base2, ratio } = BRAUN_GEAR_GEOM;
+    if (layerRef.current) {
+      layerRef.current.style.opacity = s.fade.toFixed(4);
+    }
+    if (g1WrapRef.current) {
+      g1WrapRef.current.setAttribute("transform", `translate(${s.x1.toFixed(2)} ${s.y1.toFixed(2)}) scale(${s.s1.toFixed(4)})`);
+    }
+    if (g1SpinRef.current) {
+      g1SpinRef.current.setAttribute("transform", `rotate(${(base1 + s.driveDeg).toFixed(2)})`);
+    }
+    if (g2WrapRef.current) {
+      g2WrapRef.current.setAttribute("transform", `translate(${s.x2.toFixed(2)} ${s.y2.toFixed(2)}) scale(${s.s2.toFixed(4)})`);
+    }
+    if (g2SpinRef.current) {
+      g2SpinRef.current.setAttribute("transform", `rotate(${(base2 - s.driveDeg * ratio).toFixed(2)})`);
+    }
+  };
+
+  useLayoutEffect(() => {
+    const { c1x, c1y, c2x, c2y, ux, uy } = BRAUN_GEAR_GEOM;
+    if (reducedMotion) {
+      applyFrame({ fade: 1, driveDeg: 0, x1: c1x, y1: c1y, s1: 1, x2: c2x, y2: c2y, s2: 1 });
+      return;
+    }
+    applyFrame({
+      fade: 0,
+      driveDeg: 36,
+      x1: c1x + 18,
+      y1: c1y + 18,
+      s1: 0.84,
+      x2: c2x + 14 + ux * 14,
+      y2: c2y + 14 + uy * 14,
+      s2: 0.76,
+    });
+  }, [reducedMotion]);
+
+  useEffect(() => {
+    const { c1x, c1y, c2x, c2y, ux, uy } = BRAUN_GEAR_GEOM;
+
+    if (reducedMotion) {
+      if (isPresent) {
+        applyFrame({ fade: 1, driveDeg: 0, x1: c1x, y1: c1y, s1: 1, x2: c2x, y2: c2y, s2: 1 });
+      } else {
+        safeToRemoveRef.current?.();
+      }
+      return;
+    }
+
+    let rafId = 0;
+    let delayTimer: number | null = null;
+    let cancelled = false;
+
+    if (isPresent) {
+      const startEnter = () => {
+        if (cancelled) return;
+        const startTs = performance.now();
+        const step = (now: number) => {
+          if (cancelled) return;
+          const idleSec = (now - SHANSHUI_ORIGIN_TS) / 1000;
+          const idleDrive = idleSec * GEARS_IDLE_DEG_PER_SEC;
+          const t = clamp01((now - startTs) / GEARS_ENTER_DURATION_MS);
+
+          if (t < 1) {
+            const fade = EASE_OUT(clamp01(t / 0.16));
+            const u1 = EASE_OUT(clamp01(t / 0.88));
+            const u2 = EASE_OUT(clamp01((t - 0.06) / 0.94));
+            const driveDeg = lerp(36, 0, EASE_OUT(t)) + idleDrive;
+            const gapSlide = (1 - u2) * 14;
+            applyFrame({
+              fade,
+              driveDeg,
+              x1: c1x + (1 - u1) * 18,
+              y1: c1y + (1 - u1) * 18,
+              s1: lerp(0.84, 1, u1),
+              x2: c2x + (1 - u2) * 14 + ux * gapSlide,
+              y2: c2y + (1 - u2) * 14 + uy * gapSlide,
+              s2: lerp(0.76, 1, u2),
+            });
+          } else if (!document.hidden) {
+            applyFrame({
+              fade: 1,
+              driveDeg: idleDrive,
+              x1: c1x,
+              y1: c1y,
+              s1: 1,
+              x2: c2x,
+              y2: c2y,
+              s2: 1,
+            });
+          }
+          rafId = requestAnimationFrame(step);
+        };
+        rafId = requestAnimationFrame(step);
+      };
+
+      const delay = enterDelayRef.current;
+      if (delay > 0) {
+        applyFrame({
+          fade: 0,
+          driveDeg: 36,
+          x1: c1x + 18,
+          y1: c1y + 18,
+          s1: 0.84,
+          x2: c2x + 14 + ux * 14,
+          y2: c2y + 14 + uy * 14,
+          s2: 0.76,
+        });
+        delayTimer = window.setTimeout(startEnter, delay);
+      } else {
+        startEnter();
+      }
+    } else {
+      const from = { ...snapRef.current };
+      const startTs = performance.now();
+      const step = (now: number) => {
+        if (cancelled) return;
+        const t = clamp01((now - startTs) / GEARS_EXIT_DURATION_MS);
+        const e = EASE_IN(t);
+        const fade = from.fade * (1 - EASE_IN(clamp01((t - 0.42) / 0.58)));
+        const driveDeg = from.driveDeg - e * 48;
+        applyFrame({
+          fade,
+          driveDeg,
+          x1: lerp(from.x1, c1x, e),
+          y1: lerp(from.y1, c1y, e),
+          s1: lerp(from.s1, 0, e),
+          x2: lerp(from.x2, c2x, e),
+          y2: lerp(from.y2, c2y, e),
+          s2: lerp(from.s2, 0, EASE_IN(clamp01(t / 0.88))),
+        });
+        if (t < 1) {
+          rafId = requestAnimationFrame(step);
+        } else {
+          safeToRemoveRef.current?.();
+        }
+      };
+      rafId = requestAnimationFrame(step);
+    }
+
+    return () => {
+      cancelled = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      if (delayTimer !== null) window.clearTimeout(delayTimer);
+    };
+  }, [isPresent, reducedMotion]);
+
+  return (
+    <div className="backdrop-pane">
+      <div className="backdrop-gears-wrap">
+        <svg className="backdrop-gears-svg" viewBox="0 0 196 196" fill="none">
+          <defs>
+            <mask id={mask1Id} maskUnits="userSpaceOnUse" x={-160} y={-160} width={320} height={320}>
+              <rect x={-160} y={-160} width={320} height={320} fill="white" />
+              <circle cx={0} cy={0} r={58} fill="none" stroke="black" strokeWidth={7} />
+              <circle cx={0} cy={0} r={22} fill="black" />
+              <rect x={28} y={-3.5} width={22} height={7} rx={3.5} fill="black" />
+            </mask>
+            <mask id={mask2Id} maskUnits="userSpaceOnUse" x={-100} y={-100} width={200} height={200}>
+              <rect x={-100} y={-100} width={200} height={200} fill="white" />
+              <circle cx={0} cy={0} r={12.5} fill="black" />
+              <circle cx={22.5} cy={0} r={4.5} fill="black" />
+            </mask>
+          </defs>
+          <g ref={layerRef}>
+            <g ref={g1WrapRef}>
+              <g ref={g1SpinRef}>
+                <path d={BRAUN_GEAR_GEOM.d1} fill="currentColor" mask={`url(#${mask1Id})`} />
+              </g>
+            </g>
+            <g ref={g2WrapRef}>
+              <g ref={g2SpinRef}>
+                <path d={BRAUN_GEAR_GEOM.d2} fill="currentColor" mask={`url(#${mask2Id})`} />
+              </g>
+            </g>
+          </g>
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+ * 模型卡页（Cards）：右下角折扇牌组 (Fanned Card Deck)
+ * - 入场（1000ms）：5 张圆角模型卡围绕右下支点逆时针等比扇开，动态镂空缝零叠色
+ * - 常驻：入场即停，静止落位（零常驻帧开销）
+ * - 退场：
+ *   · 默认：合扇对齐至最左最后一张（-64°）+ 并行整体逆时针旋转退场（-42°）
+ *   · 转至环境页（profiles）：顺时针反向合扇对齐至最右第一张（+3°）+ 并行整体顺时针旋转退场（+42°）
+ * ========================================================================= */
+const CARDS_ORIGIN_ANG = 15;
+const CARDS_EXIT_ROT_DELTA = -42;
+const CARDS_ENTER_DURATION_MS = 1000;
+const CARDS_EXIT_DURATION_MS = 320;
+
+const DECK_CARD_RECT = { x: -72, y: -138, width: 84, height: 124, rx: 13 } as const;
+
+const DECK_CARDS = [
+  { ang: -64, order: 4 },
+  { ang: -47, order: 3 },
+  { ang: -30, order: 2 },
+  { ang: -14, order: 1 },
+  { ang: 3, order: 0 },
+] as const;
+
+interface CardsSnapshot {
+  fade: number;
+  hubScale: number;
+  rots: number[];
+  scales: number[];
+}
+
+function CardsBackdrop({
+  enterDelayMs,
+  targetViewRef,
+}: {
+  enterDelayMs: number;
+  targetViewRef: RefObject<BackdropView>;
+}) {
+  const [isPresent, safeToRemove] = usePresence();
+  const reducedMotion = useReducedMotion();
+  const maskUid = useId().replace(/:/g, "");
+  const faceMaskId = `deck-face-${maskUid}`;
+
+  const layerRef = useRef<SVGGElement | null>(null);
+  const hubRef = useRef<SVGGElement | null>(null);
+  const cardRefs = useRef<(SVGGElement | null)[]>([]);
+  const maskCutRefs = useRef<Map<number, (SVGGElement | null)[]>>(new Map());
+
+  const enterDelayRef = useRef(enterDelayMs);
+  enterDelayRef.current = enterDelayMs;
+  const safeToRemoveRef = useRef(safeToRemove);
+  safeToRemoveRef.current = safeToRemove;
+
+  const snapRef = useRef<CardsSnapshot>({
+    fade: 0,
+    hubScale: 1,
+    rots: DECK_CARDS.map(() => CARDS_ORIGIN_ANG),
+    scales: DECK_CARDS.map(() => 0.9),
+  });
+
+  const applyFrame = (fade: number, hubScale: number, rots: number[], scales: number[]) => {
+    const snap = snapRef.current;
+    snap.fade = fade;
+    snap.hubScale = hubScale;
+
+    if (layerRef.current) {
+      layerRef.current.style.opacity = fade.toFixed(4);
+    }
+    if (hubRef.current) {
+      hubRef.current.setAttribute(
+        "transform",
+        hubScale === 1 ? "translate(166 178)" : `translate(166 178) scale(${hubScale.toFixed(4)})`,
+      );
+    }
+    for (let i = 0; i < DECK_CARDS.length; i++) {
+      snap.rots[i] = rots[i];
+      snap.scales[i] = scales[i];
+      const xf = `rotate(${rots[i].toFixed(2)}) scale(${scales[i].toFixed(4)})`;
+      const g = cardRefs.current[i];
+      if (g) g.setAttribute("transform", xf);
+      const cuts = maskCutRefs.current.get(i);
+      if (cuts) {
+        for (const cut of cuts) {
+          if (cut) cut.setAttribute("transform", xf);
+        }
+      }
+    }
+  };
+
+  useLayoutEffect(() => {
+    if (reducedMotion) {
+      applyFrame(
+        1,
+        1,
+        DECK_CARDS.map((c) => c.ang),
+        DECK_CARDS.map(() => 1),
+      );
+      return;
+    }
+    applyFrame(
+      0,
+      1,
+      DECK_CARDS.map(() => CARDS_ORIGIN_ANG),
+      DECK_CARDS.map(() => 0.9),
+    );
+  }, [reducedMotion]);
+
+  useEffect(() => {
+    const count = DECK_CARDS.length;
+
+    if (reducedMotion) {
+      if (isPresent) {
+        applyFrame(
+          1,
+          1,
+          DECK_CARDS.map((c) => c.ang),
+          DECK_CARDS.map(() => 1),
+        );
+      } else {
+        safeToRemoveRef.current?.();
+      }
+      return;
+    }
+
+    let rafId = 0;
+    let delayTimer: number | null = null;
+    let cancelled = false;
+    const rotsBuf = new Array<number>(count);
+    const scalesBuf = new Array<number>(count);
+
+    if (isPresent) {
+      const startEnter = () => {
+        if (cancelled) return;
+        const startTs = performance.now();
+        const step = (now: number) => {
+          if (cancelled) return;
+          const t = clamp01((now - startTs) / CARDS_ENTER_DURATION_MS);
+          const fade = EASE_OUT(clamp01(t / 0.16));
+          const cardScale = lerp(0.9, 1, EASE_OUT(clamp01(t / 0.46)));
+
+          for (let i = 0; i < count; i++) {
+            const c = DECK_CARDS[i];
+            const u = clamp01(t / (0.38 + 0.62 * ((c.order + 1) / count)));
+            rotsBuf[i] = lerp(CARDS_ORIGIN_ANG, c.ang, EASE_OUT(u));
+            scalesBuf[i] = cardScale;
+          }
+
+          applyFrame(fade, 1, rotsBuf, scalesBuf);
+          if (t < 1) {
+            rafId = requestAnimationFrame(step);
+          }
+        };
+        rafId = requestAnimationFrame(step);
+      };
+
+      const delay = enterDelayRef.current;
+      if (delay > 0) {
+        applyFrame(
+          0,
+          1,
+          DECK_CARDS.map(() => CARDS_ORIGIN_ANG),
+          DECK_CARDS.map(() => 0.9),
+        );
+        delayTimer = window.setTimeout(startEnter, delay);
+      } else {
+        startEnter();
+      }
+    } else {
+      // 退场并行执行两路运动：
+      // - 默认：向最左最后一张（-64°）逆时针合扇对齐 + 整体逆时针旋转退场（-42°）
+      // - 切至环境页（profiles）：顺时针反向合扇对齐至最右一张（+3°）+ 整体顺时针旋转退场（+42°），避开左侧山水
+      const reverseToProfiles = targetViewRef.current === "profiles";
+      const fromFade = snapRef.current.fade;
+      const fromHubScale = snapRef.current.hubScale;
+      const fromRots = snapRef.current.rots.slice();
+      const fromScales = snapRef.current.scales.slice();
+      const anchorAng = reverseToProfiles ? fromRots[count - 1] : fromRots[0];
+      const rotDelta = reverseToProfiles ? -CARDS_EXIT_ROT_DELTA : CARDS_EXIT_ROT_DELTA;
+
+      const startTs = performance.now();
+      const step = (now: number) => {
+        if (cancelled) return;
+        const t = clamp01((now - startTs) / CARDS_EXIT_DURATION_MS);
+        const eAll = EASE_IN(t);
+        const exitRot = lerp(0, rotDelta, eAll);
+        const foldT = clamp01(t / 0.82);
+        const fade = fromFade * (1 - EASE_IN(clamp01((t - 0.56) / 0.44)));
+        const hubScale = lerp(fromHubScale, 0.78, eAll);
+
+        for (let i = 0; i < count; i++) {
+          const waveOrder = reverseToProfiles ? i : DECK_CARDS[i].order;
+          const delay = (waveOrder / count) * 0.18;
+          const u = clamp01((foldT - delay) / (1 - delay));
+          const foldedAng = lerp(fromRots[i], anchorAng, EASE_IN(u));
+          rotsBuf[i] = foldedAng + exitRot;
+          scalesBuf[i] = lerp(fromScales[i], 0.94, eAll);
+        }
+
+        applyFrame(fade, hubScale, rotsBuf, scalesBuf);
+        if (t < 1) {
+          rafId = requestAnimationFrame(step);
+        } else {
+          safeToRemoveRef.current?.();
+        }
+      };
+      rafId = requestAnimationFrame(step);
+    }
+
+    return () => {
+      cancelled = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      if (delayTimer !== null) window.clearTimeout(delayTimer);
+    };
+  }, [isPresent, reducedMotion, targetViewRef]);
+
+  const setMaskCutRef = (cardIdx: number, slotKey: number) => (el: SVGGElement | null) => {
+    let arr = maskCutRefs.current.get(cardIdx);
+    if (!arr) {
+      arr = [];
+      maskCutRefs.current.set(cardIdx, arr);
+    }
+    arr[slotKey] = el;
+  };
+
+  return (
+    <div className="backdrop-pane">
+      <div className="backdrop-cards-wrap">
+        <svg className="backdrop-cards-svg" viewBox="0 0 196 196" fill="none">
+          <defs>
+            {DECK_CARDS.slice(0, -1).map((_, i) => (
+              <mask
+                key={i}
+                id={`deck-m-${i}-${maskUid}`}
+                maskUnits="userSpaceOnUse"
+                x={-240}
+                y={-240}
+                width={480}
+                height={480}
+              >
+                <rect x={-240} y={-240} width={480} height={480} fill="white" />
+                {DECK_CARDS.slice(i + 1).map((__, off) => {
+                  const j = i + 1 + off;
+                  return (
+                    <g key={j} ref={setMaskCutRef(j, i)}>
+                      <rect
+                        x={DECK_CARD_RECT.x}
+                        y={DECK_CARD_RECT.y}
+                        width={DECK_CARD_RECT.width}
+                        height={DECK_CARD_RECT.height}
+                        rx={DECK_CARD_RECT.rx}
+                        fill="black"
+                        stroke="black"
+                        strokeWidth={8.5}
+                        strokeLinejoin="round"
+                      />
+                    </g>
+                  );
+                })}
+              </mask>
+            ))}
+            <mask id={faceMaskId} maskUnits="userSpaceOnUse" x={-100} y={-160} width={160} height={180}>
+              <rect x={-100} y={-160} width={160} height={180} fill="white" />
+              <rect x={-56} y={-120} width={38} height={8.5} rx={4.25} fill="black" />
+              <rect x={-56} y={-104} width={24} height={5.5} rx={2.75} fill="black" />
+              <rect x={-28} y={-104} width={22} height={5.5} rx={2.75} fill="black" />
+              <rect x={-56} y={-44} width={52} height={4.5} rx={2.25} fill="black" />
+              <circle cx={-50} cy={-30} r={5.2} fill="black" />
+            </mask>
+          </defs>
+          <g ref={layerRef}>
+            <g ref={hubRef} transform="translate(166 178)">
+              {DECK_CARDS.map((_, i) => {
+                const isFront = i === DECK_CARDS.length - 1;
+                return (
+                  <g key={i} mask={isFront ? undefined : `url(#deck-m-${i}-${maskUid})`}>
+                    <g
+                      ref={(el) => {
+                        cardRefs.current[i] = el;
+                      }}
+                    >
+                      <rect
+                        x={DECK_CARD_RECT.x}
+                        y={DECK_CARD_RECT.y}
+                        width={DECK_CARD_RECT.width}
+                        height={DECK_CARD_RECT.height}
+                        rx={DECK_CARD_RECT.rx}
+                        fill="currentColor"
+                        mask={isFront ? `url(#${faceMaskId})` : undefined}
+                      />
+                    </g>
+                  </g>
+                );
+              })}
+            </g>
+          </g>
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 function PageBackdrop({ view }: { view: BackdropView }) {
   const prevViewRef = useRef<BackdropView>(view);
+  const targetViewRef = useRef<BackdropView>(view);
+  targetViewRef.current = view;
   const enterDelayMs = prevViewRef.current === view ? 0 : TAB_SWITCH_ENTER_DELAY_MS;
 
   useEffect(() => {
@@ -1078,6 +1684,10 @@ function PageBackdrop({ view }: { view: BackdropView }) {
       <AnimatePresence>
         {view === "launch" && <LaunchBackdrop key="launch" enterDelayMs={enterDelayMs} />}
         {view === "profiles" && <ProfilesBackdrop key="profiles" enterDelayMs={enterDelayMs} />}
+        {view === "cards" && (
+          <CardsBackdrop key="cards" enterDelayMs={enterDelayMs} targetViewRef={targetViewRef} />
+        )}
+        {view === "global" && <GlobalBackdrop key="global" enterDelayMs={enterDelayMs} />}
       </AnimatePresence>
     </div>
   );
