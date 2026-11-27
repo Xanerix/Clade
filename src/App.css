@@ -585,6 +585,83 @@ summary:focus-visible,
   color: var(--body-strong);
 }
 
+.env-banner {
+  --box-radius: var(--radius-card);
+  --box-pad: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: var(--box-pad) 16px;
+  border-radius: var(--box-radius);
+  border: 1px solid var(--warning);
+  background: var(--warning-wash);
+}
+
+.env-banner-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.env-banner-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--ink);
+}
+
+.env-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.warn-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.install-methods {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.install-method {
+  --box-radius: var(--radius-box);
+  --box-pad: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: var(--box-pad) var(--box-pad) var(--box-pad) 12px;
+  border-radius: var(--box-radius);
+  border: 1px solid var(--hairline);
+  background: var(--surface-soft);
+}
+
+.install-method-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.install-method-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.install-method .btn-sm {
+  flex-shrink: 0;
+  border-radius: max(0px, calc(var(--box-radius) - var(--box-pad)));
+}
+
 .launch-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));

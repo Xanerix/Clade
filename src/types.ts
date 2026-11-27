@@ -99,6 +99,8 @@ export type State = {
   systemProxy: string | null;
   defaultClassifierPrompt: string;
   globalPolicy: GlobalPolicyState;
+  claudePath: string | null;
+  hasWinget: boolean;
 };
 
 export type AuthStatus = { loggedIn: boolean; email: string; orgName: string; subscriptionType: string };

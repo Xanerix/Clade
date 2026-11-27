@@ -1,6 +1,7 @@
 //! 控制台启动器：clade <profile> [claude 参数...]；不带参数时打开 GUI。
 //! GUI 是 windows 子系统，没法在终端里正常占用控制台，所以单独做一个控制台程序。
 
+use anyhow::Context;
 use clade_lib::core;
 use std::process::{Command, ExitCode};
 
@@ -24,6 +25,11 @@ fn main() -> ExitCode {
 }
 
 fn run(name: &str, extra: &[String]) -> anyhow::Result<u8> {
+    if core::find_claude().is_none() {
+        anyhow::bail!(
+            "未检测到 Claude Code CLI（claude）。请先安装 Claude Code，并在终端确认 claude --version 可用。\n安装命令（PowerShell）：irm https://claude.ai/install.ps1 | iex"
+        );
+    }
     let cwd = std::env::current_dir()?;
 
     let conflicts = core::conflict_env();
@@ -55,7 +61,7 @@ fn run(name: &str, extra: &[String]) -> anyhow::Result<u8> {
         eprintln!("clade: 读取设置写回快照失败：{e:#}");
         None
     });
-    let status = cmd.status()?;
+    let status = cmd.status().context("启动 Claude Code CLI 失败，请确认 claude 已正确安装")?;
     if let Some(before) = wb_before {
         match core::writeback_profile(name, &before) {
             Ok(res) => {

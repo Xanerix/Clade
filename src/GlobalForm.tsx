@@ -499,7 +499,7 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                 <SettingRow
                   itemId="tools:path"
                   title="用户 PATH"
-                  tip="将 clade.exe 所在目录写入 HKCU\Environment"
+                  tip="将 clade.exe 所在目录写入 HKCU\Environment（新开终端或重启 IDE 后生效）"
                   control={
                     <button
                       type="button"
@@ -507,7 +507,11 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                       onClick={() =>
                         runTool(async () => {
                           const [dir, added] = await invoke<[string, boolean]>("add_to_path");
-                          onToast(added ? `已将 ${dir} 加入用户 PATH` : `${dir} 已在 PATH 中`);
+                          onToast(
+                            added
+                              ? `已将 ${dir} 加入用户 PATH，请新开终端后使用`
+                              : `${dir} 已在 PATH 中（若命令不可用，请重启终端或 IDE）`,
+                          );
                         })
                       }
                     >

@@ -96,6 +96,7 @@ export default function App() {
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteIdx, setPaletteIdx] = useState(0);
   const [launching, setLaunching] = useState<{ name: string; dir?: string } | null>(null);
+  const [installingClaude, setInstallingClaude] = useState<"script" | "winget" | null>(null);
   const [settingsTarget, setSettingsTarget] = useState<SettingsTarget | null>(null);
   const settingsTargetSeq = useRef(1);
   const [rev, setRev] = useState(0);
@@ -295,7 +296,25 @@ export default function App() {
 
   const settingItems = useMemo(() => (state ? buildSettingSearchItems(state) : []), [state]);
 
-  const warnCount = (state?.conflictEnv.length ? 1 : 0) + missingKeyCards.length;
+  const missingClaude = !!state && !state.claudePath;
+  const warnCount = (missingClaude ? 1 : 0) + (state?.conflictEnv.length ? 1 : 0) + missingKeyCards.length;
+
+  const runInstallClaude = async (method: "script" | "winget") => {
+    if (installingClaude) return;
+    setInstallingClaude(method);
+    try {
+      await invoke("install_claude", { method });
+      const s = await refresh();
+      toast(
+        s.claudePath ? `已检测到 ${s.claudePath}` : "安装窗口已关闭，但仍未检测到 claude",
+        !s.claudePath,
+      );
+    } catch (e) {
+      toast(String(e), true);
+    } finally {
+      setInstallingClaude(null);
+    }
+  };
 
   const confirmLeave = async () => {
     if (!dirtyRef.current) return true;
@@ -660,6 +679,50 @@ export default function App() {
                   </h1>
                 </div>
 
+                {missingClaude && (
+                  <div className="env-banner">
+                    <div className="env-banner-body">
+                      <div className="env-banner-title">未检测到 Claude Code CLI（claude）</div>
+                      <div className="set-sub">
+                        启动任何环境前需要先安装 Claude Code，可选用官方脚本或 Winget 一键安装。
+                      </div>
+                    </div>
+                    <div className="env-banner-actions">
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={installingClaude !== null}
+                        onClick={() =>
+                          refresh().then(
+                            (s) => toast(s.claudePath ? `已检测到 ${s.claudePath}` : "仍未检测到 claude", !s.claudePath),
+                            (e) => toast(String(e), true),
+                          )
+                        }
+                      >
+                        重新检测
+                      </button>
+                      {state.hasWinget && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={installingClaude !== null}
+                          onClick={() => void runInstallClaude("winget")}
+                        >
+                          {installingClaude === "winget" ? "Winget 安装中…" : "Winget 安装"}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={installingClaude !== null}
+                        onClick={() => void runInstallClaude("script")}
+                      >
+                        {installingClaude === "script" ? "脚本安装中…" : "脚本安装"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {state.profiles.length === 0 ? (
                   <div className="empty-state">
                     <div>还没有任何环境，先创建一个环境吧。</div>
@@ -850,6 +913,37 @@ export default function App() {
                 </div>
               </div>
               <div className="mc-body">
+                {missingClaude && (
+                  <div className="warn-item">
+                    <div>
+                      <div style={{ fontWeight: 500, color: "var(--ink)" }}>未检测到 Claude Code CLI</div>
+                      <div className="set-sub" style={{ marginTop: 2 }}>
+                        未在 PATH 或默认目录找到 <span className="mono">claude.exe</span> / <span className="mono">claude.cmd</span>，请先安装 Claude Code。
+                      </div>
+                    </div>
+                    <div className="warn-actions">
+                      {state.hasWinget && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={installingClaude !== null}
+                          onClick={() => void runInstallClaude("winget")}
+                        >
+                          {installingClaude === "winget" ? "安装中…" : "Winget"}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={installingClaude !== null}
+                        onClick={() => void runInstallClaude("script")}
+                      >
+                        {installingClaude === "script" ? "安装中…" : "脚本安装"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {state.conflictEnv.length > 0 && (
                   <div className="warn-item">
                     <div>

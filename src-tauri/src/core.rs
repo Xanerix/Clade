@@ -1735,7 +1735,7 @@ pub fn delete_card(store: &mut Store, id: &str) -> Result<()> {
 pub fn card_claude(id: &str) -> Result<Command> {
     let dir = card_dir(id);
     fs::create_dir_all(&dir)?;
-    let mut cmd = Command::new("claude");
+    let mut cmd = claude_command()?;
     for k in CONFLICT_ENV {
         cmd.env_remove(k);
     }
@@ -1841,7 +1841,7 @@ pub fn usage(card: &str) -> Result<Usage> {
         }
     }
     let (mut cmd, config) = if card.is_empty() {
-        let mut cmd = Command::new("claude");
+        let mut cmd = claude_command()?;
         for k in CONFLICT_ENV {
             cmd.env_remove(k);
         }
@@ -2277,7 +2277,7 @@ pub fn command(name: &str, cwd: &Path, extra: &[String]) -> Result<Command> {
     let dir = profile_dir(name);
     touch_recent(name, cwd)?;
 
-    let mut cmd = Command::new("claude");
+    let mut cmd = claude_command()?;
     cmd.current_dir(cwd);
     for k in CONFLICT_ENV {
         cmd.env_remove(k);
@@ -2387,10 +2387,159 @@ pub fn command(name: &str, cwd: &Path, extra: &[String]) -> Result<Command> {
     Ok(cmd)
 }
 
-// ---------- pwsh7 ----------
+// ---------- pwsh7 与 Claude Code CLI 检测 ----------
+
+fn read_reg_path(root: winreg::HKEY, subkey: &str) -> Option<String> {
+    use winreg::{enums::KEY_READ, RegKey};
+    let key = RegKey::predef(root).open_subkey_with_flags(subkey, KEY_READ).ok()?;
+    key.get_value::<String, _>("Path").ok()
+}
+
+/// 展开 %VAR%（只展开常见环境变量；不依赖 Win32 API，便于单测）。
+fn expand_env_vars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let var = &after[..end];
+        if !var.is_empty() {
+            if let Ok(val) = env::var(var) {
+                out.push_str(&val);
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+        out.push('%');
+        out.push_str(var);
+        out.push('%');
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 所有候选搜索目录：当前进程 PATH + 注册表用户/系统 PATH（刚装完未重启进程也能检测到）。
+fn search_path_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !dirs.iter().any(|d: &PathBuf| d.as_os_str().eq_ignore_ascii_case(p.as_os_str())) {
+            dirs.push(p);
+        }
+    };
+    if let Some(p) = env::var_os("PATH") {
+        for d in env::split_paths(&p) {
+            push(d);
+        }
+    }
+    for (root, subkey) in [
+        (winreg::enums::HKEY_CURRENT_USER, "Environment"),
+        (winreg::enums::HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+    ] {
+        if let Some(raw) = read_reg_path(root, subkey) {
+            let expanded = expand_env_vars(&raw);
+            for d in env::split_paths(&expanded) {
+                push(d);
+            }
+        }
+    }
+    dirs
+}
 
 fn find_in_path(exe: &str) -> Option<PathBuf> {
-    env::split_paths(&env::var_os("PATH")?).map(|d| d.join(exe)).find(|f| f.is_file())
+    search_path_dirs().into_iter().map(|d| d.join(exe)).find(|f| f.is_file())
+}
+
+/// 查找已安装的 Claude Code CLI。
+/// 优先找原生 claude.exe（PATH、默认安装位置 ~/.local/bin 与 WinGet Links），
+/// 其次兼容通过 npm / pnpm / yarn 全局安装的 claude.cmd。
+pub fn find_claude() -> Option<PathBuf> {
+    if let Some(p) = find_in_path("claude.exe") {
+        return Some(p);
+    }
+    let local_bin = home().join(".local").join("bin").join("claude.exe");
+    if local_bin.is_file() {
+        return Some(local_bin);
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        let winget_link = PathBuf::from(local_app_data).join("Microsoft").join("WinGet").join("Links").join("claude.exe");
+        if winget_link.is_file() {
+            return Some(winget_link);
+        }
+    }
+    if let Some(pf) = env::var_os("ProgramFiles") {
+        let winget_link = PathBuf::from(pf).join("WinGet").join("Links").join("claude.exe");
+        if winget_link.is_file() {
+            return Some(winget_link);
+        }
+    }
+    if let Some(p) = find_in_path("claude.cmd") {
+        return Some(p);
+    }
+    if let Some(appdata) = env::var_os("APPDATA") {
+        let npm_cmd = PathBuf::from(appdata).join("npm").join("claude.cmd");
+        if npm_cmd.is_file() {
+            return Some(npm_cmd);
+        }
+    }
+    None
+}
+
+/// 从 npm 生成的 claude.cmd 解析对应的 node 与入口脚本，避免套一层 cmd /c 导致参数转义和 Ctrl+C 弹窗问题。
+fn resolve_npm_cmd(cmd_path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dir = cmd_path.parent()?;
+    let text = fs::read_to_string(cmd_path).ok()?;
+    let rel = parse_npm_cmd_script(&text)?;
+    let script = dir.join(rel);
+    if !script.is_file() {
+        return None;
+    }
+    let local_node = dir.join("node.exe");
+    let node = if local_node.is_file() {
+        local_node
+    } else {
+        find_in_path("node.exe")?
+    };
+    Some((node, script))
+}
+
+fn parse_npm_cmd_script(text: &str) -> Option<&str> {
+    for marker in ["%dp0%\\", "%~dp0\\"] {
+        if let Some(pos) = text.find(marker) {
+            let rest = &text[pos + marker.len()..];
+            let end = rest.find(['"', '\r', '\n', ' ']).unwrap_or(rest.len());
+            let rel = rest[..end].trim();
+            if rel.ends_with(".js") || rel.ends_with(".mjs") || rel.ends_with(".cjs") {
+                return Some(rel);
+            }
+        }
+    }
+    None
+}
+
+/// 构造启动 Claude Code CLI 的 Command；未安装时返回明确提示。
+pub fn claude_command() -> Result<Command> {
+    let Some(claude) = find_claude() else {
+        bail!(
+            "未检测到 Claude Code CLI（claude）。请先安装 Claude Code，并在终端确认 claude --version 可用。\n安装命令（PowerShell）：irm https://claude.ai/install.ps1 | iex"
+        );
+    };
+    let is_cmd = claude.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if is_cmd {
+        if let Some((node, script)) = resolve_npm_cmd(&claude) {
+            let mut cmd = Command::new(node);
+            cmd.arg(script);
+            return Ok(cmd);
+        }
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/c").arg(&claude);
+        return Ok(cmd);
+    }
+    Ok(Command::new(claude))
 }
 
 /// 找 pwsh7。刚用 winget 装完时本进程的 PATH 还是旧的，所以再查一下默认安装位置。
@@ -2496,4 +2645,40 @@ fn broadcast_env_change() {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_npm_cmd_wrapper_script() {
+        let npm_shim = r#"@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+"%_prog%"  "%dp0%\node_modules\@anthropic-ai\claude-code\cli.js" %*
+"#;
+        assert_eq!(
+            parse_npm_cmd_script(npm_shim),
+            Some(r"node_modules\@anthropic-ai\claude-code\cli.js")
+        );
+        assert_eq!(parse_npm_cmd_script("@echo off\r\necho hello\r\n"), None);
+    }
+
+    #[test]
+    fn expands_known_env_vars_in_path() {
+        let key = "CLADE_TEST_EXPAND_VAR";
+        unsafe { env::set_var(key, r"C:\Users\Test") };
+        assert_eq!(
+            expand_env_vars(r"%CLADE_TEST_EXPAND_VAR%\.local\bin;%NO_SUCH_VAR_12345%\bin"),
+            r"C:\Users\Test\.local\bin;%NO_SUCH_VAR_12345%\bin"
+        );
+        unsafe { env::remove_var(key) };
+    }
+}
+
 

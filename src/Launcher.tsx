@@ -4,10 +4,12 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type { DirCheck, State } from "./types";
 import { ModalDialog, MsgLine, type Msg } from "./ui";
 
-type Pwsh = { pwsh: string | null; winget: boolean };
+type EnvStatus = { pwsh: string | null; winget: boolean; claude: string | null };
+type ClaudeInstallMethod = "script" | "winget";
 type DirItem = { dir: string; check: DirCheck };
 
 const PWSH_URL = "https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows";
+const CLAUDE_INSTALL_URL = "https://docs.anthropic.com/en/docs/claude-code/setup";
 
 const hasWarn = (c: DirCheck) => c.nestedClaudeMd.length > 0 || c.scratchpadSkipped;
 
@@ -19,9 +21,10 @@ type Props = {
   onClose: (text?: string) => void;
 };
 
-/** 启动流程：先确认有 pwsh7（没有就引导安装），再选工作目录（或检查指定目录）。 */
+/** 启动流程：先确认有 pwsh7 与 Claude Code CLI（没有就引导安装），再选工作目录（或检查指定目录）。 */
 export default function Launcher({ name, initialDir, refresh, onClose }: Props) {
   const [noPwsh, setNoPwsh] = useState<{ winget: boolean; installing: boolean } | null>(null);
+  const [noClaude, setNoClaude] = useState<{ winget: boolean; installing: ClaudeInstallMethod | null } | null>(null);
   const [recent, setRecent] = useState<DirItem[] | null>(null);
   const [picked, setPicked] = useState<DirItem | null>(null);
   const [msg, setMsg] = useState<Msg>(null);
@@ -43,13 +46,19 @@ export default function Launcher({ name, initialDir, refresh, onClose }: Props) 
   }
 
   async function start(isCancelled: () => boolean = () => false) {
-    const st = await invoke<Pwsh>("pwsh_status");
+    const st = await invoke<EnvStatus>("pwsh_status");
     if (isCancelled()) return;
     if (!st.pwsh) {
       setNoPwsh({ winget: st.winget, installing: false });
+      setNoClaude(null);
       return;
     }
     setNoPwsh(null);
+    if (!st.claude) {
+      setNoClaude({ winget: st.winget, installing: null });
+      return;
+    }
+    setNoClaude(null);
     if (initialDir) {
       const c = await check(initialDir);
       if (isCancelled()) return;
@@ -112,7 +121,7 @@ export default function Launcher({ name, initialDir, refresh, onClose }: Props) 
   async function installPwsh() {
     setNoPwsh((m) => m && { ...m, installing: true });
     try {
-      const st = await invoke<Pwsh>("install_pwsh");
+      const st = await invoke<EnvStatus>("install_pwsh");
       if (!st.pwsh) {
         setNoPwsh({ winget: st.winget, installing: false });
         setMsg({ text: "安装结束了，但还是没找到 pwsh.exe", bad: true });
@@ -122,6 +131,25 @@ export default function Launcher({ name, initialDir, refresh, onClose }: Props) 
       await start();
     } catch (e) {
       setNoPwsh((m) => m && { ...m, installing: false });
+      fail(e);
+    }
+  }
+
+  async function installClaude(method: ClaudeInstallMethod) {
+    setNoClaude((m) => m && { ...m, installing: method });
+    setMsg(null);
+    try {
+      const st = await invoke<EnvStatus>("install_claude", { method });
+      await refresh();
+      if (!st.claude) {
+        setNoClaude({ winget: st.winget, installing: null });
+        setMsg({ text: "安装窗口已关闭，但仍未检测到 claude，请确认安装是否完成或点「重新检测」", bad: true });
+        return;
+      }
+      setMsg({ text: "已检测到 Claude Code CLI" });
+      await start();
+    } catch (e) {
+      setNoClaude((m) => m && { ...m, installing: null });
       fail(e);
     }
   }
@@ -202,6 +230,96 @@ export default function Launcher({ name, initialDir, refresh, onClose }: Props) 
                   </button>
                 </>
               )}
+            </div>
+          </div>
+        </div>
+      </ModalDialog>
+    );
+  }
+
+  if (noClaude) {
+    const busy = noClaude.installing !== null;
+    return (
+      <ModalDialog label="未检测到 Claude Code CLI" canClose={!busy} onClose={() => onClose()}>
+        <div className="modal-card narrow">
+          <div className="mc-head flat">
+            <div className="mc-top">
+              <h2 className="mc-title">未检测到 Claude Code CLI</h2>
+              <button
+                type="button"
+                className="btn-circle"
+                aria-label="关闭"
+                disabled={busy}
+                onClick={() => onClose()}
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+          <div className="mc-body">
+            <p style={{ margin: 0 }}>
+              clade 是 Claude Code 的多环境启动器，需要本机先安装 <span className="mono">claude</span> 命令行工具。当前在
+              PATH 和默认安装目录中均未找到 <span className="mono">claude.exe</span> 或 <span className="mono">claude.cmd</span>。
+            </p>
+            <div className="install-methods">
+              <div className="install-method">
+                <div className="install-method-info">
+                  <div className="install-method-title">官方脚本安装</div>
+                  <div className="set-sub mono">irm https://claude.ai/install.ps1 | iex</div>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  disabled={busy}
+                  onClick={() => installClaude("script")}
+                >
+                  {noClaude.installing === "script" ? "正在安装…" : "脚本安装"}
+                </button>
+              </div>
+              <div className="install-method">
+                <div className="install-method-info">
+                  <div className="install-method-title">Winget 安装</div>
+                  <div className="set-sub mono">
+                    {noClaude.winget ? "winget install --id Anthropic.ClaudeCode" : "本机未检测到 winget"}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={busy || !noClaude.winget}
+                  onClick={() => installClaude("winget")}
+                >
+                  {noClaude.installing === "winget" ? "正在安装…" : "Winget 安装"}
+                </button>
+              </div>
+            </div>
+            <MsgLine msg={msg} />
+          </div>
+          <div className="mc-foot">
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={busy}
+              onClick={() => invoke("open_url", { url: CLAUDE_INSTALL_URL }).catch(fail)}
+            >
+              安装文档
+            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="button" className="btn btn-sm" disabled={busy} onClick={() => onClose()}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => {
+                  setMsg(null);
+                  void refresh();
+                  start().catch(fail);
+                }}
+              >
+                重新检测
+              </button>
             </div>
           </div>
         </div>

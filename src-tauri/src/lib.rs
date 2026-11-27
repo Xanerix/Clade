@@ -56,6 +56,10 @@ struct State {
     default_classifier_prompt: &'static str,
     /// 从 ~/.claude/settings.json 读出的权限与署名当前状态
     global_policy: GlobalPolicyState,
+    /// 检测到的 Claude Code CLI 路径（None 表示未安装或不在 PATH 中）
+    claude_path: Option<String>,
+    /// 本机是否可用 winget（用于安装引导）
+    has_winget: bool,
 }
 
 #[tauri::command]
@@ -81,6 +85,8 @@ fn get_state() -> Res<State> {
         system_proxy: core::system_proxy(),
         default_classifier_prompt: core::DEFAULT_CLASSIFIER_PROMPT,
         global_policy: core::global_policy_state(),
+        claude_path: core::find_claude().map(|p| p.display().to_string()),
+        has_winget: core::has_winget(),
     })
 }
 
@@ -177,9 +183,11 @@ async fn usage(card: String) -> Res<Usage> {
 async fn card_login(id: String) -> Res<AuthStatus> {
     core::validate_name(&id).map_err(err)?;
     let pwsh = core::find_pwsh().ok_or("找不到 pwsh7")?;
+    let claude = core::find_claude().ok_or("未检测到 Claude Code CLI（claude），请先安装 Claude Code")?;
     let dir = core::card_dir(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let d = ps_quote(&dir.to_string_lossy());
+    let claude_q = ps_quote(&claude.to_string_lossy());
     let mut clear: Vec<String> = core::CONFLICT_ENV.iter().map(|k| format!("Remove-Item Env:{k} -ErrorAction Ignore")).collect();
     // 代理开关和 core::apply_proxy 一样处理；pwsh 配置文件里设的代理变量在这之前已经生效
     match core::load().map_err(err)?.global.proxy {
@@ -193,7 +201,7 @@ async fn card_login(id: String) -> Res<AuthStatus> {
         None => {}
     }
     let script = format!(
-        "{}; $env:CLAUDE_CONFIG_DIR={d}; $env:CLAUDE_SECURESTORAGE_CONFIG_DIR={d}; claude auth login --claudeai; if ($LASTEXITCODE) {{ Read-Host '登录没有成功，按回车关闭窗口' }}",
+        "{}; $env:CLAUDE_CONFIG_DIR={d}; $env:CLAUDE_SECURESTORAGE_CONFIG_DIR={d}; & {claude_q} auth login --claudeai; if ($LASTEXITCODE) {{ Read-Host '登录没有成功，按回车关闭窗口' }}",
         clear.join("; ")
     );
     let cmdline = format!("\"{}\" -NoLogo -Command \"{script}\"", pwsh.display());
@@ -285,6 +293,7 @@ fn delete_profile(name: String) -> Res<()> {
 struct PwshStatus {
     pwsh: Option<String>,
     winget: bool,
+    claude: Option<String>,
 }
 
 #[tauri::command]
@@ -292,7 +301,34 @@ fn pwsh_status() -> PwshStatus {
     PwshStatus {
         pwsh: core::find_pwsh().map(|p| p.display().to_string()),
         winget: core::has_winget(),
+        claude: core::find_claude().map(|p| p.display().to_string()),
     }
+}
+
+/// 在新控制台窗口里安装 Claude Code（method: "script" 官方脚本 / "winget"），装完返回重新检测的结果。
+#[tauri::command]
+async fn install_claude(method: String) -> Res<PwshStatus> {
+    let cmdline = match method.as_str() {
+        "winget" => {
+            if !core::has_winget() {
+                return Err("未检测到 winget，请改用官方脚本安装".into());
+            }
+            "winget install --id Anthropic.ClaudeCode".to_string()
+        }
+        "script" => {
+            let shell = core::find_pwsh().unwrap_or_else(|| PathBuf::from("powershell.exe"));
+            format!(
+                "\"{}\" -NoLogo -Command \"irm https://claude.ai/install.ps1 | iex; if (-not $?) {{ Read-Host '安装遇到错误，按回车关闭窗口' }}\"",
+                shell.display()
+            )
+        }
+        _ => return Err(format!("不支持的安装方式：{method}")),
+    };
+    tauri::async_runtime::spawn_blocking(move || core::spawn_console(&cmdline, None, true))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(err)?;
+    Ok(pwsh_status())
 }
 
 /// 在新控制台窗口里跑 winget 安装 pwsh7（用户能看到进度、回答协议提示），装完返回重新检测的结果。
@@ -320,7 +356,10 @@ fn check_dir(name: String, dir: String) -> Res<DirCheck> {
 fn launch(name: String, dir: String) -> Res<()> {
     let clade = exe_dir().join("clade.exe");
     if !clade.exists() {
-        return Err(format!("找不到 {}，请先 cargo build --bin clade", clade.display()));
+        return Err(format!("找不到 {}，请检查安装是否完整或是否被杀毒软件隔离", clade.display()));
+    }
+    if core::find_claude().is_none() {
+        return Err("未检测到 Claude Code CLI（claude），请先安装 Claude Code 后再启动".into());
     }
     let pwsh = core::find_pwsh().ok_or("找不到 pwsh7")?;
     // name 已通过 validate_name，只含小写字母、数字和 -
@@ -350,6 +389,10 @@ fn open_url(url: String) -> Res<()> {
 #[tauri::command]
 fn add_to_path() -> Res<(String, bool)> {
     let dir = exe_dir();
+    let clade = dir.join("clade.exe");
+    if !clade.is_file() {
+        return Err(format!("未在 {} 找到 clade.exe，请检查安装是否完整或是否被杀毒软件隔离", dir.display()));
+    }
     let added = core::add_to_user_path(&dir).map_err(err)?;
     Ok((dir.display().to_string(), added))
 }
@@ -384,6 +427,7 @@ pub fn run() {
             delete_profile,
             pwsh_status,
             install_pwsh,
+            install_claude,
             recent_dirs,
             check_dir,
             launch,
