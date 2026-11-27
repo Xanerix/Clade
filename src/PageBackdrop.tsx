@@ -1,7 +1,66 @@
-import { memo, useEffect, useId, useLayoutEffect, useRef, type RefObject } from "react";
+import { memo, useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AnimatePresence, usePresence, useReducedMotion } from "motion/react";
 
 export type BackdropView = "launch" | "profiles" | "cards" | "global";
+
+function useWindowActive(): boolean {
+  const [active, setActive] = useState(
+    () => typeof document === "undefined" || (!document.hidden && document.hasFocus()),
+  );
+
+  useEffect(() => {
+    let focused = document.hasFocus();
+    const sync = () => setActive(!document.hidden && focused);
+
+    const onFocus = () => {
+      focused = true;
+      sync();
+    };
+    const onBlur = () => {
+      focused = false;
+      sync();
+    };
+    const onVis = () => sync();
+
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onVis);
+
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void (async () => {
+      try {
+        const win = getCurrentWindow();
+        const isFocused = await win.isFocused();
+        if (disposed) return;
+        focused = isFocused;
+        sync();
+        const off = await win.onFocusChanged(({ payload }) => {
+          focused = payload;
+          sync();
+        });
+        if (disposed) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      } catch {
+        // 非 Tauri 环境回退到 window focus/blur 与 visibilitychange
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onVis);
+      unlisten?.();
+    };
+  }, []);
+
+  return active;
+}
 
 interface PetalSpec {
   k: number;
@@ -10,7 +69,7 @@ interface PetalSpec {
 }
 
 /**
- * 精确分解自官方 Claude Logo (logos/claude-icon.svg, viewBox 256×257)：
+ * Claude 星芒花瓣几何（原 viewBox 256×257）：
  * 以 12 道内谷收敛中心 (136.89, 133.71) 为坐标原点 (0, 0)，
  * 仅保留右下角构图 (viewBox 180×180, hub 162,162) 实际伸出中心圆 (r=30.2) 外的 6 片可见花瓣，
  * 按右→左逆时针展开顺次排列；其余 6 片在视口内完全落于中心圆内，不产生越界杂瓣。
@@ -366,7 +425,6 @@ const SHANSHUI_FONT = `500 ${SHANSHUI_FONT_SIZE}px "JetBrains Mono", "Cascadia M
 const SHANSHUI_ENTER_DURATION_MS = 760;
 const SHANSHUI_EXIT_DURATION_MS = 320;
 const SHANSHUI_IDLE_INTERVAL_MS = 66;
-const SHANSHUI_ORIGIN_TS = typeof performance !== "undefined" ? performance.now() : 0;
 
 const SHANSHUI_RAMPS = {
   far: [":", ";", "-", ".", "·", " "],
@@ -688,7 +746,7 @@ function buildWaterGrid(scene: ShanshuiScene, sec: number): { chars: string[][];
   return { chars, alphas };
 }
 
-function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
+function ProfilesBackdrop({ enterDelayMs, windowActive }: { enterDelayMs: number; windowActive: boolean }) {
   const [isPresent, safeToRemove] = usePresence();
   const reducedMotion = useReducedMotion();
 
@@ -698,6 +756,11 @@ function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
   enterDelayRef.current = enterDelayMs;
   const safeToRemoveRef = useRef(safeToRemove);
   safeToRemoveRef.current = safeToRemove;
+  const activeRef = useRef(windowActive);
+  activeRef.current = windowActive;
+  const resumeRef = useRef<(() => void) | null>(null);
+  const idleElapsedRef = useRef(0);
+  const idleTickRef = useRef<number | null>(null);
 
   const layoutRef = useRef<{
     width: number;
@@ -965,12 +1028,19 @@ function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
     const ro = new ResizeObserver(() => {
       layoutRef.current.scene = null;
       const ds = drawStateRef.current;
-      const idleSec = reducedMotion ? 0 : (performance.now() - SHANSHUI_ORIGIN_TS) / 1000;
-      renderCanvas(ds.phase, ds.t, idleSec, ds.exitFrom);
+      renderCanvas(ds.phase, ds.t, reducedMotion ? 0 : idleElapsedRef.current, ds.exitFrom);
     });
     ro.observe(wrap);
     return () => ro.disconnect();
   }, [reducedMotion]);
+
+  useEffect(() => {
+    if (windowActive) {
+      resumeRef.current?.();
+    } else {
+      idleTickRef.current = null;
+    }
+  }, [windowActive]);
 
   useEffect(() => {
     if (reducedMotion) {
@@ -987,6 +1057,14 @@ function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
     let delayTimer: number | null = null;
     let cancelled = false;
 
+    const advanceIdleSec = (now: number) => {
+      if (idleTickRef.current !== null) {
+        idleElapsedRef.current += Math.min(0.25, Math.max(0, (now - idleTickRef.current) / 1000));
+      }
+      idleTickRef.current = now;
+      return idleElapsedRef.current;
+    };
+
     if (isPresent) {
       const startEnter = () => {
         if (cancelled) return;
@@ -994,38 +1072,63 @@ function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
         let lastIdleDraw = 0;
         let settled = false;
 
+        const schedule = () => {
+          if (cancelled || rafId !== 0) return;
+          rafId = requestAnimationFrame(step);
+        };
+
         const step = (now: number) => {
+          rafId = 0;
           if (cancelled) return;
-          const idleSec = (now - SHANSHUI_ORIGIN_TS) / 1000;
+          const idleSec = advanceIdleSec(now);
           const t = clamp01((now - startTs) / SHANSHUI_ENTER_DURATION_MS);
 
           if (t < 1) {
             drawStateRef.current = { phase: "enter", t, exitFrom: null };
             renderCanvas("enter", t, idleSec, null);
             lastIdleDraw = now;
+            schedule();
           } else if (!settled) {
             settled = true;
             drawStateRef.current = { phase: "enter", t: 1, exitFrom: null };
             renderCanvas("enter", 1, idleSec, null);
             lastIdleDraw = now;
-          } else if (!document.hidden && now - lastIdleDraw >= SHANSHUI_IDLE_INTERVAL_MS) {
-            lastIdleDraw = now;
-            renderCanvas("enter", 1, idleSec, null);
+            if (activeRef.current) {
+              schedule();
+            } else {
+              idleTickRef.current = null;
+            }
+          } else {
+            if (!activeRef.current) {
+              idleTickRef.current = null;
+              return;
+            }
+            if (now - lastIdleDraw >= SHANSHUI_IDLE_INTERVAL_MS) {
+              lastIdleDraw = now;
+              renderCanvas("enter", 1, idleSec, null);
+            }
+            schedule();
           }
-          rafId = requestAnimationFrame(step);
         };
-        rafId = requestAnimationFrame(step);
+
+        resumeRef.current = () => {
+          if (cancelled) return;
+          idleTickRef.current = performance.now();
+          schedule();
+        };
+        schedule();
       };
 
       const delay = enterDelayRef.current;
       if (delay > 0) {
         drawStateRef.current = { phase: "enter", t: 0, exitFrom: null };
-        renderCanvas("enter", 0, (performance.now() - SHANSHUI_ORIGIN_TS) / 1000, null);
+        renderCanvas("enter", 0, idleElapsedRef.current, null);
         delayTimer = window.setTimeout(startEnter, delay);
       } else {
         startEnter();
       }
     } else {
+      resumeRef.current = null;
       const exitFrom: ShanshuiSnapshot = {
         m0: { ...snapRef.current.m0 },
         m1: { ...snapRef.current.m1 },
@@ -1036,7 +1139,7 @@ function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
       const startTs = performance.now();
       const step = (now: number) => {
         if (cancelled) return;
-        const idleSec = (now - SHANSHUI_ORIGIN_TS) / 1000;
+        const idleSec = idleElapsedRef.current;
         const t = clamp01((now - startTs) / SHANSHUI_EXIT_DURATION_MS);
         drawStateRef.current = { phase: "exit", t, exitFrom };
         renderCanvas("exit", t, idleSec, exitFrom);
@@ -1051,6 +1154,8 @@ function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
 
     return () => {
       cancelled = true;
+      resumeRef.current = null;
+      idleTickRef.current = null;
       if (rafId) cancelAnimationFrame(rafId);
       if (delayTimer !== null) window.clearTimeout(delayTimer);
     };
@@ -1068,7 +1173,7 @@ function ProfilesBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
 /* =========================================================================
  * 设置页（Global）：右下角博朗实心圆齿级数啮合齿轮组 (18:8 = 2.25:1)
  * - 入场：大小轮按精确模数同频旋转并沿连心线靠拢咬合落位
- * - 常驻：持续轻缓 2.25:1 反向真啮合运转（窗口最小化自动暂停）
+ * - 常驻：持续轻缓 2.25:1 反向真啮合运转（窗口失焦或最小化自动暂停）
  * - 退场：同步啮合加速并绕各自轴心原地旋缩至消失
  * ========================================================================= */
 const GEARS_ENTER_DURATION_MS = 680;
@@ -1157,7 +1262,7 @@ interface GearsSnapshot {
   s2: number;
 }
 
-function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
+function GlobalBackdrop({ enterDelayMs, windowActive }: { enterDelayMs: number; windowActive: boolean }) {
   const [isPresent, safeToRemove] = usePresence();
   const reducedMotion = useReducedMotion();
   const maskUid = useId().replace(/:/g, "");
@@ -1174,6 +1279,11 @@ function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
   enterDelayRef.current = enterDelayMs;
   const safeToRemoveRef = useRef(safeToRemove);
   safeToRemoveRef.current = safeToRemove;
+  const activeRef = useRef(windowActive);
+  activeRef.current = windowActive;
+  const resumeRef = useRef<(() => void) | null>(null);
+  const idleElapsedRef = useRef(0);
+  const idleTickRef = useRef<number | null>(null);
 
   const snapRef = useRef<GearsSnapshot>({
     fade: 0,
@@ -1225,6 +1335,14 @@ function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
   }, [reducedMotion]);
 
   useEffect(() => {
+    if (windowActive) {
+      resumeRef.current?.();
+    } else {
+      idleTickRef.current = null;
+    }
+  }, [windowActive]);
+
+  useEffect(() => {
     const { c1x, c1y, c2x, c2y, ux, uy } = BRAUN_GEAR_GEOM;
 
     if (reducedMotion) {
@@ -1240,13 +1358,29 @@ function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
     let delayTimer: number | null = null;
     let cancelled = false;
 
+    const advanceIdleSec = (now: number) => {
+      if (idleTickRef.current !== null) {
+        idleElapsedRef.current += Math.min(0.25, Math.max(0, (now - idleTickRef.current) / 1000));
+      }
+      idleTickRef.current = now;
+      return idleElapsedRef.current;
+    };
+
     if (isPresent) {
       const startEnter = () => {
         if (cancelled) return;
         const startTs = performance.now();
+        let settled = false;
+
+        const schedule = () => {
+          if (cancelled || rafId !== 0) return;
+          rafId = requestAnimationFrame(step);
+        };
+
         const step = (now: number) => {
+          rafId = 0;
           if (cancelled) return;
-          const idleSec = (now - SHANSHUI_ORIGIN_TS) / 1000;
+          const idleSec = advanceIdleSec(now);
           const idleDrive = idleSec * GEARS_IDLE_DEG_PER_SEC;
           const t = clamp01((now - startTs) / GEARS_ENTER_DURATION_MS);
 
@@ -1266,7 +1400,9 @@ function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
               y2: c2y + (1 - u2) * 14 + uy * gapSlide,
               s2: lerp(0.76, 1, u2),
             });
-          } else if (!document.hidden) {
+            schedule();
+          } else if (!settled) {
+            settled = true;
             applyFrame({
               fade: 1,
               driveDeg: idleDrive,
@@ -1277,10 +1413,36 @@ function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
               y2: c2y,
               s2: 1,
             });
+            if (activeRef.current) {
+              schedule();
+            } else {
+              idleTickRef.current = null;
+            }
+          } else {
+            if (!activeRef.current) {
+              idleTickRef.current = null;
+              return;
+            }
+            applyFrame({
+              fade: 1,
+              driveDeg: idleDrive,
+              x1: c1x,
+              y1: c1y,
+              s1: 1,
+              x2: c2x,
+              y2: c2y,
+              s2: 1,
+            });
+            schedule();
           }
-          rafId = requestAnimationFrame(step);
         };
-        rafId = requestAnimationFrame(step);
+
+        resumeRef.current = () => {
+          if (cancelled) return;
+          idleTickRef.current = performance.now();
+          schedule();
+        };
+        schedule();
       };
 
       const delay = enterDelayRef.current;
@@ -1300,6 +1462,7 @@ function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
         startEnter();
       }
     } else {
+      resumeRef.current = null;
       const from = { ...snapRef.current };
       const startTs = performance.now();
       const step = (now: number) => {
@@ -1329,6 +1492,8 @@ function GlobalBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
 
     return () => {
       cancelled = true;
+      resumeRef.current = null;
+      idleTickRef.current = null;
       if (rafId) cancelAnimationFrame(rafId);
       if (delayTimer !== null) window.clearTimeout(delayTimer);
     };
@@ -1670,6 +1835,7 @@ function CardsBackdrop({
 }
 
 function PageBackdrop({ view }: { view: BackdropView }) {
+  const windowActive = useWindowActive();
   const prevViewRef = useRef<BackdropView>(view);
   const targetViewRef = useRef<BackdropView>(view);
   targetViewRef.current = view;
@@ -1683,11 +1849,15 @@ function PageBackdrop({ view }: { view: BackdropView }) {
     <div className="stage-backdrop" aria-hidden="true">
       <AnimatePresence>
         {view === "launch" && <LaunchBackdrop key="launch" enterDelayMs={enterDelayMs} />}
-        {view === "profiles" && <ProfilesBackdrop key="profiles" enterDelayMs={enterDelayMs} />}
+        {view === "profiles" && (
+          <ProfilesBackdrop key="profiles" enterDelayMs={enterDelayMs} windowActive={windowActive} />
+        )}
         {view === "cards" && (
           <CardsBackdrop key="cards" enterDelayMs={enterDelayMs} targetViewRef={targetViewRef} />
         )}
-        {view === "global" && <GlobalBackdrop key="global" enterDelayMs={enterDelayMs} />}
+        {view === "global" && (
+          <GlobalBackdrop key="global" enterDelayMs={enterDelayMs} windowActive={windowActive} />
+        )}
       </AnimatePresence>
     </div>
   );
