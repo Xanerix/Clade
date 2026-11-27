@@ -16,8 +16,8 @@
 # 安装前端依赖
 bun install
 
-# 开发运行（在 pwsh7 中执行：先构建 clade.exe，再启动 tauri dev）
-.\dev.ps1
+# 开发运行（标准 Tauri dev 模式，支持前端 HMR 与 Rust 热重载）
+bun run tauri dev
 
 # 仅前端类型检查与打包
 bun run build

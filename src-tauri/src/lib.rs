@@ -1,4 +1,5 @@
 pub mod antigravity;
+pub mod cli;
 pub mod convert;
 pub mod core;
 pub mod gateway;
@@ -354,16 +355,24 @@ fn check_dir(name: String, dir: String) -> Res<DirCheck> {
 /// 新开一个 pwsh7 窗口，在 dir 里运行 clade <name>；claude 退出后窗口停在提示符。
 #[tauri::command]
 fn launch(name: String, dir: String) -> Res<()> {
-    let clade = exe_dir().join("clade.exe");
-    if !clade.exists() {
-        return Err(format!("找不到 {}，请检查安装是否完整或是否被杀毒软件隔离", clade.display()));
-    }
     if core::find_claude().is_none() {
         return Err("未检测到 Claude Code CLI（claude），请先安装 Claude Code 后再启动".into());
     }
     let pwsh = core::find_pwsh().ok_or("找不到 pwsh7")?;
     // name 已通过 validate_name，只含小写字母、数字和 -
-    let script = format!("& {} {}", ps_quote(&clade.to_string_lossy()), name);
+    #[cfg(debug_assertions)]
+    let script = {
+        let gui = std::env::current_exe().map_err(|e| e.to_string())?;
+        format!("& {} --clade-cli {}", ps_quote(&gui.to_string_lossy()), name)
+    };
+    #[cfg(not(debug_assertions))]
+    let script = {
+        let clade = exe_dir().join("clade.exe");
+        if !clade.exists() {
+            return Err(format!("找不到 {}，请检查安装是否完整或是否被杀毒软件隔离", clade.display()));
+        }
+        format!("& {} {}", ps_quote(&clade.to_string_lossy()), name)
+    };
     // Windows 路径里不会有双引号，直接包一层即可
     let cmdline = format!("\"{}\" -NoLogo -NoExit -Command \"{script}\"", pwsh.display());
     core::spawn_console(&cmdline, Some(Path::new(&dir)), false).map_err(err)
