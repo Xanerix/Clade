@@ -441,7 +441,7 @@ fn openai_chat_forward() {
     assert_eq!(v["model"], "gpt-4o");
     assert_eq!(v["stop_reason"], "end_turn");
     assert_eq!(v["content"], json!([{"type": "text", "text": "hello from openai"}]));
-    assert_eq!(v["usage"], json!({"input_tokens": 20, "output_tokens": 5, "cache_read_input_tokens": 4}));
+    assert_eq!(v["usage"], json!({"input_tokens": 16, "output_tokens": 5, "cache_read_input_tokens": 4}));
     {
         let s = seen.lock().unwrap();
         let (path, h, body) = s.last().unwrap();
@@ -564,7 +564,7 @@ fn openai_responses_forward() {
     let v: Value = r.json().unwrap();
     assert_eq!(v["id"], "msg_resp_n1");
     assert_eq!(v["content"], json!([{"type": "text", "text": "hello from responses"}]));
-    assert_eq!(v["usage"], json!({"input_tokens": 18, "output_tokens": 6, "cache_read_input_tokens": 3}));
+    assert_eq!(v["usage"], json!({"input_tokens": 15, "output_tokens": 6, "cache_read_input_tokens": 3}));
     {
         let s = seen.lock().unwrap();
         let (path, h, body) = s.last().unwrap();
@@ -659,7 +659,7 @@ fn gemini_native_forward() {
     let v: Value = r.json().unwrap();
     assert_eq!(v["id"], "msg_gem-n1");
     assert_eq!(v["content"], json!([{"type": "text", "text": "hello from gemini"}]));
-    assert_eq!(v["usage"], json!({"input_tokens": 16, "output_tokens": 5, "cache_read_input_tokens": 2}));
+    assert_eq!(v["usage"], json!({"input_tokens": 14, "output_tokens": 5, "cache_read_input_tokens": 2}));
     {
         let s = seen.lock().unwrap();
         let (path, h, body) = s.last().unwrap();

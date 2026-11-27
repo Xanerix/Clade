@@ -146,15 +146,16 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> &'static str {
 }
 
 /// 映射 OpenAI usage 对象 → Anthropic usage 对象。
+/// OpenAI 的 `prompt_tokens` 包含 `cached_tokens`，而 Anthropic 的 `input_tokens` 不含 `cache_read_input_tokens`。
 fn map_usage(usage: Option<&Value>) -> Value {
-    let input_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0);
+    let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0);
     let output_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0);
     let cache_read = usage
         .and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     json!({
-        "input_tokens": input_tokens,
+        "input_tokens": prompt_tokens.saturating_sub(cache_read),
         "output_tokens": output_tokens,
         "cache_read_input_tokens": cache_read,
     })
@@ -913,11 +914,7 @@ impl SseConverter {
         if self.message_id.is_empty() {
             self.message_id = ensure_msg_id("");
         }
-        let input_tokens = first_usage.and_then(|u| u.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0);
-        let cache_read = first_usage
-            .and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let u = map_usage(first_usage);
         out.push(format_sse(
             "message_start",
             &json!({
@@ -931,9 +928,9 @@ impl SseConverter {
                     "stop_reason": null,
                     "stop_sequence": null,
                     "usage": {
-                        "input_tokens": input_tokens,
+                        "input_tokens": u["input_tokens"],
                         "output_tokens": 0,
-                        "cache_read_input_tokens": cache_read,
+                        "cache_read_input_tokens": u["cache_read_input_tokens"],
                     }
                 }
             }),
@@ -1343,7 +1340,7 @@ fn responses_web_search_error(item: &Value) -> Option<Value> {
 }
 
 fn map_responses_usage(usage: Option<&Value>) -> Value {
-    let input_tokens = usage
+    let raw_input = usage
         .and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens")))
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -1351,14 +1348,23 @@ fn map_responses_usage(usage: Option<&Value>) -> Value {
         .and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens")))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cache_read = usage
+    // OpenAI Responses 的 input_tokens/prompt_tokens 包含 cached_tokens；若上游已经直接给 Anthropic 风格的 cache_read_input_tokens 则不扣减。
+    let cached_in_total = usage
         .and_then(|u| {
             u.pointer("/input_tokens_details/cached_tokens")
                 .or_else(|| u.pointer("/prompt_tokens_details/cached_tokens"))
-                .or_else(|| u.get("cache_read_input_tokens"))
         })
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .and_then(Value::as_u64);
+    let (input_tokens, cache_read) = match cached_in_total {
+        Some(cached) => (raw_input.saturating_sub(cached), cached),
+        None => {
+            let direct = usage
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            (raw_input, direct)
+        }
+    };
     json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -2723,8 +2729,9 @@ fn map_gemini_usage(usage: Option<&Value>) -> Value {
                 .saturating_sub(prompt)
         });
     let cached = usage.and_then(|u| u.get("cachedContentTokenCount")).and_then(Value::as_u64).unwrap_or(0);
+    // Gemini 的 promptTokenCount 包含 cachedContentTokenCount，Anthropic 的 input_tokens 仅计未命中缓存部分。
     json!({
-        "input_tokens": prompt,
+        "input_tokens": prompt.saturating_sub(cached),
         "output_tokens": output,
         "cache_read_input_tokens": cached,
     })
@@ -4162,7 +4169,7 @@ mod tests {
         assert_eq!(out["stop_sequence"], Value::Null);
         assert_eq!(
             out["usage"],
-            json!({"input_tokens": 120, "output_tokens": 35, "cache_read_input_tokens": 40})
+            json!({"input_tokens": 80, "output_tokens": 35, "cache_read_input_tokens": 40})
         );
         let content = out["content"].as_array().unwrap();
         assert_eq!(content.len(), 3, "reasoning_content 应被丢弃");
@@ -4226,7 +4233,7 @@ mod tests {
         assert_eq!(events[12].1["delta"]["stop_reason"], "tool_use");
         assert_eq!(
             events[12].1["usage"],
-            json!({"input_tokens": 80, "output_tokens": 22, "cache_read_input_tokens": 10})
+            json!({"input_tokens": 70, "output_tokens": 22, "cache_read_input_tokens": 10})
         );
     }
 
@@ -4365,7 +4372,7 @@ mod tests {
         let out = openai_responses_to_anthropic(&up).unwrap();
         assert_eq!(out["id"], "msg_resp_123");
         assert_eq!(out["stop_reason"], "tool_use");
-        assert_eq!(out["usage"], json!({"input_tokens": 50, "output_tokens": 12, "cache_read_input_tokens": 10}));
+        assert_eq!(out["usage"], json!({"input_tokens": 40, "output_tokens": 12, "cache_read_input_tokens": 10}));
         let content = out["content"].as_array().unwrap();
         assert_eq!(content.len(), 2, "reasoning 应被丢弃");
         assert_eq!(content[0], json!({"type": "text", "text": "完成"}));
@@ -4422,7 +4429,7 @@ mod tests {
         assert_eq!(events[0].1["message"]["id"], "msg_resp_s1");
         assert_eq!(events[5].1["content_block"], json!({"type": "tool_use", "id": "call_x", "name": "read", "input": {}}));
         assert_eq!(events[9].1["delta"]["stop_reason"], "tool_use");
-        assert_eq!(events[9].1["usage"], json!({"input_tokens": 30, "output_tokens": 10, "cache_read_input_tokens": 5}));
+        assert_eq!(events[9].1["usage"], json!({"input_tokens": 25, "output_tokens": 10, "cache_read_input_tokens": 5}));
 
         // response.failed → error 事件
         let mut conv = ResponsesSseConverter::new();
@@ -4569,7 +4576,7 @@ mod tests {
         assert_eq!(out["id"], "msg_resp-g1");
         assert_eq!(out["model"], "gemini-2.5-pro");
         assert_eq!(out["stop_reason"], "tool_use");
-        assert_eq!(out["usage"], json!({"input_tokens": 40, "output_tokens": 15, "cache_read_input_tokens": 8}));
+        assert_eq!(out["usage"], json!({"input_tokens": 32, "output_tokens": 15, "cache_read_input_tokens": 8}));
         let content = out["content"].as_array().unwrap();
         assert_eq!(content.len(), 3, "thought 应映射为 thinking 块");
         assert_eq!(content[0], json!({"type": "thinking", "thinking": "内部思考"}));
@@ -4620,7 +4627,7 @@ mod tests {
         assert_eq!(events[2].1["delta"], json!({"type": "thinking_delta", "thinking": "想一下"}));
         assert_eq!(events[4].1["content_block"], json!({"type": "text", "text": ""}));
         assert_eq!(events[11].1["delta"]["stop_reason"], "tool_use");
-        assert_eq!(events[11].1["usage"], json!({"input_tokens": 25, "output_tokens": 9, "cache_read_input_tokens": 5}));
+        assert_eq!(events[11].1["usage"], json!({"input_tokens": 20, "output_tokens": 9, "cache_read_input_tokens": 5}));
     }
 
     #[test]
@@ -5025,5 +5032,38 @@ mod tests {
         assert_eq!(start_types, vec!["server_tool_use", "web_search_tool_result", "text"]);
         let delta_ev = events.iter().find(|(e, _)| e == "message_delta").unwrap();
         assert_eq!(delta_ev.1["usage"]["server_tool_use"]["web_search_requests"], 1);
+    }
+
+    #[test]
+    fn usage_mapping_avoids_double_counting_cached_tokens() {
+        // OpenAI Chat: prompt_tokens 含 cached_tokens，且 cached > prompt 时 saturating_sub 不下溢
+        assert_eq!(
+            map_usage(Some(&json!({"prompt_tokens": 100, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 100}}))),
+            json!({"input_tokens": 0, "output_tokens": 10, "cache_read_input_tokens": 100})
+        );
+        assert_eq!(
+            map_usage(Some(&json!({"prompt_tokens": 50, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 80}}))),
+            json!({"input_tokens": 0, "output_tokens": 5, "cache_read_input_tokens": 80})
+        );
+
+        // OpenAI Responses: cached_tokens 从 input_tokens 扣除；原生 cache_read_input_tokens 不扣
+        assert_eq!(
+            map_responses_usage(Some(&json!({"input_tokens": 100, "output_tokens": 10, "input_tokens_details": {"cached_tokens": 90}}))),
+            json!({"input_tokens": 10, "output_tokens": 10, "cache_read_input_tokens": 90})
+        );
+        assert_eq!(
+            map_responses_usage(Some(&json!({"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 90}))),
+            json!({"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 90})
+        );
+
+        // Gemini: promptTokenCount 含 cachedContentTokenCount
+        assert_eq!(
+            map_gemini_usage(Some(&json!({"promptTokenCount": 651558, "candidatesTokenCount": 221, "cachedContentTokenCount": 648354}))),
+            json!({"input_tokens": 3204, "output_tokens": 221, "cache_read_input_tokens": 648354})
+        );
+        assert_eq!(
+            map_gemini_usage(Some(&json!({"promptTokenCount": 20, "candidatesTokenCount": 5, "cachedContentTokenCount": 50}))),
+            json!({"input_tokens": 0, "output_tokens": 5, "cache_read_input_tokens": 50})
+        );
     }
 }
