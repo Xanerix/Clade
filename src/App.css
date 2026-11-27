@@ -276,8 +276,8 @@ summary:focus-visible,
 }
 
 .mast-tools .btn-circle svg {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
 }
 
 .mast-tools .warn-dot {
@@ -424,8 +424,52 @@ summary:focus-visible,
 .btn-sm {
   height: 32px;
   padding: 0 12px;
+  gap: 5px;
   font-size: 13px;
   border-radius: 6px;
+}
+
+.btn-icon-sm {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 6px;
+}
+
+.ui-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
+  flex-shrink: 0;
+}
+
+.ui-icon-sm {
+  width: 13px;
+  height: 13px;
+  display: block;
+  flex-shrink: 0;
+}
+
+.icon-launch {
+  transition: transform var(--dur-fast) var(--ease-editorial);
+}
+
+.btn:hover:not(:disabled) .icon-launch {
+  transform: translate(1px, -1px);
+}
+
+.inline-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inline-arrow {
+  width: 15px;
+  height: 15px;
+  display: block;
+  color: var(--muted);
+  flex-shrink: 0;
 }
 
 .btn-circle {
@@ -465,6 +509,7 @@ summary:focus-visible,
 .btn-circle svg {
   width: 16px;
   height: 16px;
+  display: block;
 }
 
 .btn-circle.warn {
@@ -502,6 +547,21 @@ summary:focus-visible,
 
 .search-btn:hover {
   border-color: var(--muted-soft);
+  color: var(--ink);
+}
+
+.search-btn-lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.search-btn-lead .ui-icon {
+  color: var(--muted-soft);
+  transition: color var(--dur-fast) var(--ease-editorial);
+}
+
+.search-btn:hover .search-btn-lead .ui-icon {
   color: var(--ink);
 }
 
@@ -804,6 +864,9 @@ button.badge-pill:hover {
 }
 
 .dir-go {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 12.5px;
   color: var(--primary);
   opacity: 0;
@@ -905,6 +968,19 @@ button.badge-pill:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.toc-name-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.toc-icon {
+  width: 15px;
+  height: 15px;
+  display: block;
+  flex-shrink: 0;
 }
 
 .toc-sub {
@@ -1333,8 +1409,8 @@ button.badge-pill:hover {
 .s-search svg {
   position: absolute;
   left: 11px;
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
   color: var(--muted-soft);
   pointer-events: none;
 }
@@ -1395,8 +1471,8 @@ button.badge-pill:hover {
 }
 
 .s-nav-item svg {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   color: var(--muted-soft);
   flex-shrink: 0;
   transition: color var(--dur-fast) var(--ease-editorial);
@@ -1595,6 +1671,23 @@ button.badge-pill:hover {
   background: var(--surface-card);
   border-color: var(--primary);
   color: var(--ink);
+}
+
+.mode-icon {
+  width: 18px;
+  height: 18px;
+  display: block;
+  color: var(--muted);
+  flex-shrink: 0;
+  transition: color var(--dur-fast) var(--ease-editorial);
+}
+
+.mode-tile:hover .mode-icon {
+  color: var(--ink);
+}
+
+.mode-tile.on .mode-icon {
+  color: var(--primary);
 }
 
 .source-grid {
@@ -2208,6 +2301,19 @@ button.badge-pill:hover {
   font-family: var(--serif);
   font-size: 18px;
   font-weight: 400;
+}
+
+.book-add-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.book-add-icon {
+  width: 18px;
+  height: 18px;
+  display: block;
+  flex-shrink: 0;
 }
 
 .book-add:hover {

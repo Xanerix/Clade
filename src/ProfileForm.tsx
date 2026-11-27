@@ -23,9 +23,16 @@ import {
   type Usage,
 } from "./types";
 import {
+  ArrowLeftRightIcon,
+  ArrowRightIcon,
+  ArrowUpRightIcon,
   CheckIcon,
-  CollapseBox,
+  GatewayForkIcon,
   MinusIcon,
+  PlusIcon,
+} from "./icons";
+import {
+  CollapseBox,
   PromptPolicyControl,
   SegControl,
   SettingRow,
@@ -331,7 +338,10 @@ export default function ProfileForm({
         >
           {isNew && <motion.span className="toc-pill" layoutId="profile-toc-pill" transition={TRANSITION_INDICATOR} />}
           <span className="toc-content">
-            <span className="toc-name">+ 新建</span>
+            <span className="toc-name toc-name-row">
+              <PlusIcon className="toc-icon" strokeWidth={1.45} />
+              <span>新建</span>
+            </span>
           </span>
         </button>
       </aside>
@@ -369,7 +379,8 @@ export default function ProfileForm({
             <div className="ch-actions">
               {!isNew && (
                 <button type="button" className="btn btn-primary btn-sm" onClick={() => void launch()}>
-                  启动 ↗
+                  <span>启动</span>
+                  <ArrowUpRightIcon className="ui-icon icon-launch" strokeWidth={1.6} />
                 </button>
               )}
               <button type="submit" className={`btn btn-sm ${dirty || isNew ? "btn-primary" : ""}`}>
@@ -460,7 +471,7 @@ export default function ProfileForm({
                         onClick={() => set("mode", "direct")}
                       >
                         <span>直连</span>
-                        <span>→</span>
+                        <ArrowRightIcon className="mode-icon" />
                       </button>
                       <button
                         type="button"
@@ -468,7 +479,7 @@ export default function ProfileForm({
                         onClick={() => set("mode", "aggregate")}
                       >
                         <span>聚合网关</span>
-                        <span>⑂</span>
+                        <GatewayForkIcon className="mode-icon" />
                       </button>
                     </div>
 
@@ -680,7 +691,13 @@ export default function ProfileForm({
                 {(["skills", "plugins", "mcp"] as AssetKind[]).map(renderAssetSection)}
 
                 <section className="ed-sec">
-                  <h2 className="ed-sec-h">共享目录 ↔ ~/.claude</h2>
+                  <h2 className="ed-sec-h">
+                    <span className="inline-title">
+                      <span>共享目录</span>
+                      <ArrowLeftRightIcon className="inline-arrow" />
+                      <span>~/.claude</span>
+                    </span>
+                  </h2>
                   <div className="set-card">{SHARED_KEYS.map(renderSharedRow)}</div>
                 </section>
               </>

@@ -22,6 +22,17 @@ import {
   type State,
   type Usage,
 } from "./types";
+import {
+  AlertTriangleIcon,
+  ArrowUpRightIcon,
+  CloseIcon,
+  CornerDownLeftIcon,
+  FolderIcon,
+  MoonIcon,
+  PlusIcon,
+  SearchIcon,
+  SunIcon,
+} from "./icons";
 import { ModalDialog, UsageBars } from "./ui";
 import { buildSettingSearchItems, matchSettingSearchItem, type SettingsTarget } from "./settingsIndex";
 import ProfileForm from "./ProfileForm";
@@ -579,7 +590,10 @@ export default function App() {
                 setPaletteOpen(true);
               }}
             >
-              <span>搜索环境、模型卡或设置</span>
+              <span className="search-btn-lead">
+                <SearchIcon className="ui-icon" />
+                <span>搜索环境、模型卡或设置</span>
+              </span>
               <span className="kbd">Ctrl K</span>
             </button>
 
@@ -590,11 +604,7 @@ export default function App() {
                 title={`有 ${warnCount} 项提醒`}
                 onClick={() => setWarnOpen(true)}
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
-                  <line x1="12" y1="9" x2="12" y2="13" />
-                  <line x1="12" y1="17" x2="12.01" y2="17" />
-                </svg>
+                <AlertTriangleIcon />
                 <span className="warn-dot" />
               </button>
             )}
@@ -610,9 +620,7 @@ export default function App() {
                 )
               }
             >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-                <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
-              </svg>
+              <FolderIcon />
             </button>
 
             <button type="button" className="btn-circle" title="切换明暗主题" onClick={toggleTheme}>
@@ -625,16 +633,7 @@ export default function App() {
                   exit={{ opacity: 0, rotate: 25, scale: 0.85 }}
                   transition={TRANSITION_FAST}
                 >
-                  {theme === "dark" ? (
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-                      <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
-                    </svg>
-                  ) : (
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-                      <circle cx="12" cy="12" r="4" />
-                      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
-                    </svg>
-                  )}
+                  {theme === "dark" ? <MoonIcon /> : <SunIcon />}
                 </motion.span>
               </AnimatePresence>
             </button>
@@ -727,7 +726,8 @@ export default function App() {
                   <div className="empty-state">
                     <div>还没有任何环境，先创建一个环境吧。</div>
                     <button type="button" className="btn btn-primary btn-sm" onClick={() => go("profiles", null)}>
-                      + 新建环境
+                      <PlusIcon className="ui-icon" strokeWidth={1.6} />
+                      <span>新建环境</span>
                     </button>
                   </div>
                 ) : (
@@ -749,7 +749,8 @@ export default function App() {
                               className="btn btn-primary btn-sm"
                               onClick={() => setLaunching({ name: p.name })}
                             >
-                              启动 ↗
+                              <span>启动</span>
+                              <ArrowUpRightIcon className="ui-icon icon-launch" strokeWidth={1.6} />
                             </button>
                           </div>
 
@@ -786,7 +787,10 @@ export default function App() {
                                     <span className="dir-name">{baseName(d)}</span>
                                     <span className="dir-path">{d}</span>
                                   </span>
-                                  <span className="dir-go">打开 ↵</span>
+                                  <span className="dir-go">
+                                    <span>打开</span>
+                                    <CornerDownLeftIcon className="ui-icon-sm" />
+                                  </span>
                                 </button>
                               ))
                             )}
@@ -842,7 +846,10 @@ export default function App() {
                 <div className="book-grid">
                   {state.cards.map(renderCardTile)}
                   <button type="button" className="book-card book-add" onClick={() => setModalCard("__new__")}>
-                    + 添加模型卡
+                    <span className="book-add-label">
+                      <PlusIcon className="book-add-icon" strokeWidth={1.35} />
+                      <span>添加模型卡</span>
+                    </span>
                   </button>
                 </div>
               </div>
@@ -908,7 +915,7 @@ export default function App() {
                 <div className="mc-top">
                   <h2 className="mc-title">警告项目</h2>
                   <button type="button" className="btn-circle" aria-label="关闭" onClick={() => setWarnOpen(false)}>
-                    ✕
+                    <CloseIcon />
                   </button>
                 </div>
               </div>

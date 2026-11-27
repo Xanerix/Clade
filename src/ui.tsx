@@ -149,17 +149,7 @@ export function ModalDialog({
   );
 }
 
-export const CheckIcon = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-    <polyline points="20 6 9 17 4 12" />
-  </svg>
-);
-
-export const MinusIcon = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
-    <line x1="5" y1="12" x2="19" y2="12" />
-  </svg>
-);
+export { CheckIcon, MinusIcon } from "./icons";
 
 const pad = (n: number) => String(n).padStart(2, "0");
 export const fmtTime = (d: Date) =>

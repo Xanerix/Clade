@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { DirCheck, State } from "./types";
+import { CloseIcon } from "./icons";
 import { ModalDialog, MsgLine, type Msg } from "./ui";
 
 type EnvStatus = { pwsh: string | null; winget: boolean; claude: string | null };
@@ -185,7 +186,7 @@ export default function Launcher({ name, initialDir, refresh, onClose }: Props) 
             <div className="mc-top">
               <h2 className="mc-title">需要 PowerShell 7</h2>
               <button type="button" className="btn-circle" aria-label="关闭" disabled={noPwsh.installing} onClick={() => onClose()}>
-                ✕
+                <CloseIcon />
               </button>
             </div>
           </div>
@@ -252,7 +253,7 @@ export default function Launcher({ name, initialDir, refresh, onClose }: Props) 
                 disabled={busy}
                 onClick={() => onClose()}
               >
-                ✕
+                <CloseIcon />
               </button>
             </div>
           </div>
@@ -336,7 +337,7 @@ export default function Launcher({ name, initialDir, refresh, onClose }: Props) 
             <div className="mc-top">
               <h2 className="mc-title">启动 {name}</h2>
               <button type="button" className="btn-circle" aria-label="关闭" onClick={() => onClose()}>
-                ✕
+                <CloseIcon />
               </button>
             </div>
           </div>
@@ -364,7 +365,7 @@ export default function Launcher({ name, initialDir, refresh, onClose }: Props) 
               {picked && <div className="mc-sub">{picked.dir}</div>}
             </div>
             <button type="button" className="btn-circle" aria-label="关闭" onClick={() => onClose()}>
-              ✕
+              <CloseIcon />
             </button>
           </div>
         </div>

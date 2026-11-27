@@ -10,7 +10,19 @@ import {
   type SettingsSec,
   type SettingsTarget,
 } from "./settingsIndex";
-import { CheckIcon, PromptPolicyControl, SettingRow, SwitchGroups, ToggleSwitch, TriState } from "./ui";
+import {
+  ArrowLeftRightIcon,
+  CheckIcon,
+  FolderIcon,
+  GlobeIcon,
+  LayersIcon,
+  MessageIcon,
+  SearchIcon,
+  ShieldIcon,
+  SlidersIcon,
+  WrenchIcon,
+} from "./icons";
+import { PromptPolicyControl, SettingRow, SwitchGroups, ToggleSwitch, TriState } from "./ui";
 
 type Props = {
   state: State;
@@ -22,59 +34,14 @@ type Props = {
 };
 
 const ICONS: Record<SettingsSec | "search", React.ReactNode> = {
-  general: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <line x1="4" y1="21" x2="4" y2="14" />
-      <line x1="4" y1="10" x2="4" y2="3" />
-      <line x1="12" y1="21" x2="12" y2="12" />
-      <line x1="12" y1="8" x2="12" y2="3" />
-      <line x1="20" y1="21" x2="20" y2="16" />
-      <line x1="20" y1="12" x2="20" y2="3" />
-      <line x1="2" y1="14" x2="6" y2="14" />
-      <line x1="10" y1="8" x2="14" y2="8" />
-      <line x1="18" y1="16" x2="22" y2="16" />
-    </svg>
-  ),
-  assets: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <polygon points="12 2 2 7 12 12 22 7 12 2" />
-      <polyline points="2 17 12 22 22 17" />
-      <polyline points="2 12 12 17 22 12" />
-    </svg>
-  ),
-  shared: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
-    </svg>
-  ),
-  prompts: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-    </svg>
-  ),
-  proxy: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <circle cx="12" cy="12" r="10" />
-      <line x1="2" y1="12" x2="22" y2="12" />
-      <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-    </svg>
-  ),
-  switches: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-    </svg>
-  ),
-  tools: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
-    </svg>
-  ),
-  search: (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <circle cx="11" cy="11" r="8" />
-      <path d="m21 21-4.3-4.3" />
-    </svg>
-  ),
+  general: <SlidersIcon />,
+  assets: <LayersIcon />,
+  shared: <FolderIcon />,
+  prompts: <MessageIcon />,
+  proxy: <GlobeIcon />,
+  switches: <ShieldIcon />,
+  tools: <WrenchIcon />,
+  search: <SearchIcon />,
 };
 
 export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRefresh, onDirtyChange }: Props) {
@@ -362,7 +329,13 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
 
           {sec === "shared" && (
             <div className="settings-group-block">
-              <h3 className="settings-group-h">Junction ↔ ~/.claude</h3>
+              <h3 className="settings-group-h">
+                <span className="inline-title">
+                  <span>Junction</span>
+                  <ArrowLeftRightIcon className="inline-arrow" />
+                  <span>~/.claude</span>
+                </span>
+              </h3>
               <div className="set-card">
                 {SHARED_KEYS.map((k) => {
                   const info = SHARED_INFO[k];

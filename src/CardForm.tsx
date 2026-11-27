@@ -18,7 +18,8 @@ import {
   type State,
   type Usage,
 } from "./types";
-import { CheckIcon, CollapseBox, ModalDialog, MsgLine, UsagePanel, type Msg } from "./ui";
+import { CheckIcon, CloseIcon } from "./icons";
+import { CollapseBox, ModalDialog, MsgLine, UsagePanel, type Msg } from "./ui";
 
 type Props = {
   state: State;
@@ -328,7 +329,7 @@ export default function CardForm({
               {!isNew && <div className="mc-sub">{form.id}</div>}
             </div>
             <button type="button" className="btn-circle" aria-label="关闭" onClick={() => void requestClose()}>
-              ✕
+              <CloseIcon />
             </button>
           </div>
           {tabs.length > 1 && (
@@ -683,11 +684,12 @@ export default function CardForm({
                         </button>
                         <button
                           type="button"
-                          className="btn btn-ghost btn-danger btn-sm"
-                          style={{ padding: "0 8px", height: 30 }}
+                          className="btn btn-ghost btn-danger btn-icon-sm"
+                          aria-label={`移除模型 ${m.id}`}
+                          title="移除模型"
                           onClick={() => removeModel(m.id)}
                         >
-                          ✕
+                          <CloseIcon className="ui-icon" />
                         </button>
                       </div>
                     ))
