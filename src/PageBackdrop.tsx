@@ -48,8 +48,42 @@ const LAUNCH_CORNER_PETALS: readonly PetalSpec[] = [
   },
 ];
 
+const LAUNCH_EXTRA_EXIT_PETALS: readonly PetalSpec[] = [
+  {
+    k: 5,
+    ang: 78.17,
+    d: "M0 0 L39.07 -21.26 L39.85 -20.1 L41.86 -20.29 L72.32 -26.77 L88.78 -29.75 L108.42 -33.12 L117.3 -28.98 L118.27 -24.76 L114.77 -16.14 L93.77 -10.96 L69.14 -6.03 L32.46 2.65 L32.01 2.98 Z",
+  },
+  {
+    k: 6,
+    ang: 102.18,
+    d: "M0 0 L32.01 2.98 L32.52 3.62 L49.05 5.18 L56.12 5.57 L73.42 5.57 L105.63 7.97 L114.06 13.54 L119.11 20.35 L118.27 25.53 L105.31 32.14 L87.81 27.99 L46.98 18.27 L32.98 14.77 L31.03 14.77 Z",
+  },
+  {
+    k: 7,
+    ang: 132.92,
+    d: "M0 0 L31.03 14.77 L31.03 15.94 L42.7 27.34 L64.09 46.66 L90.85 71.55 L92.21 77.7 L88.78 82.56 L85.15 82.04 L61.62 64.35 L52.55 56.38 L32.01 39.08 L30.65 39.08 Z",
+  },
+  {
+    k: 8,
+    ang: 149.27,
+    d: "M0 0 L30.65 39.08 L30.65 40.89 L35.38 47.82 L60.39 85.41 L61.69 96.95 L59.87 100.71 L53.39 102.98 L46.26 101.68 L31.62 81.14 L16.52 58 L4.33 37.26 Z",
+  },
+  {
+    k: 9,
+    ang: -172.79,
+    d: "M0 0 L4.33 37.26 L2.84 38.1 L-4.35 115.55 L-7.72 119.5 L-15.5 122.49 L-21.98 117.56 L-25.42 109.59 L-21.98 93.84 L-17.83 73.3 L-14.46 56.96 L-11.42 36.68 L-9.6 29.94 L-9.73 29.48 Z",
+  },
+  {
+    k: 10,
+    ang: -141.14,
+    d: "M0 0 L-9.73 29.48 L-11.22 29.68 L-26.52 50.68 L-49.78 82.11 L-68.19 101.81 L-72.6 103.56 L-80.25 99.61 L-79.53 92.54 L-75.26 86.26 L-49.79 53.85 L-34.43 33.76 L-24.51 22.16 L-24.57 20.47 Z",
+  },
+];
+
 const LAUNCH_ORIGIN_ANG = 38;
-const LAUNCH_EXIT_ANG = -124;
+const LAUNCH_HUB_BASE = 162;
+const LAUNCH_EXIT_ROT_DEG = -64;
 const LAUNCH_ENTER_DURATION_MS = 680;
 const LAUNCH_EXIT_DURATION_MS = 300;
 const TAB_SWITCH_ENTER_DELAY_MS = 140;
@@ -78,6 +112,9 @@ const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 interface LaunchSnapshot {
   fade: number;
   coreScale: number;
+  hubShift: number;
+  hubRot: number;
+  hubScale: number;
   deltas: number[];
   scales: number[];
 }
@@ -87,7 +124,8 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
   const reducedMotion = useReducedMotion();
 
   const layerRef = useRef<SVGGElement | null>(null);
-  const coreRef = useRef<SVGCircleElement | null>(null);
+  const hubRef = useRef<SVGGElement | null>(null);
+  const coreRef = useRef<SVGGElement | null>(null);
   const petalRefs = useRef<(SVGGElement | null)[]>([]);
   const enterDelayRef = useRef(enterDelayMs);
   enterDelayRef.current = enterDelayMs;
@@ -97,17 +135,38 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
   const snapRef = useRef<LaunchSnapshot>({
     fade: 0,
     coreScale: 0.55,
+    hubShift: 0,
+    hubRot: 0,
+    hubScale: 1,
     deltas: LAUNCH_CORNER_PETALS.map((p) => LAUNCH_ORIGIN_ANG - p.ang),
     scales: LAUNCH_CORNER_PETALS.map(() => 0.92),
   });
 
-  const applyFrame = (fade: number, coreScale: number, deltas: number[], scales: number[]) => {
+  const applyFrame = (
+    fade: number,
+    coreScale: number,
+    hubShift: number,
+    hubRot: number,
+    hubScale: number,
+    deltas: number[],
+    scales: number[],
+  ) => {
     const snap = snapRef.current;
     snap.fade = fade;
     snap.coreScale = coreScale;
+    snap.hubShift = hubShift;
+    snap.hubRot = hubRot;
+    snap.hubScale = hubScale;
 
     if (layerRef.current) {
       layerRef.current.style.opacity = fade.toFixed(4);
+    }
+    if (hubRef.current) {
+      const c = (LAUNCH_HUB_BASE + hubShift).toFixed(2);
+      hubRef.current.setAttribute(
+        "transform",
+        `translate(${c} ${c}) rotate(${hubRot.toFixed(2)}) scale(${hubScale.toFixed(4)})`,
+      );
     }
     if (coreRef.current) {
       coreRef.current.setAttribute("transform", `scale(${coreScale.toFixed(4)})`);
@@ -128,6 +187,9 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
       applyFrame(
         1,
         1,
+        0,
+        0,
+        1,
         LAUNCH_CORNER_PETALS.map(() => 0),
         LAUNCH_CORNER_PETALS.map(() => 1),
       );
@@ -136,6 +198,9 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
     applyFrame(
       0,
       0.55,
+      0,
+      0,
+      1,
       LAUNCH_CORNER_PETALS.map((p) => LAUNCH_ORIGIN_ANG - p.ang),
       LAUNCH_CORNER_PETALS.map(() => 0.92),
     );
@@ -148,6 +213,9 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
       if (isPresent) {
         applyFrame(
           1,
+          1,
+          0,
+          0,
           1,
           LAUNCH_CORNER_PETALS.map(() => 0),
           LAUNCH_CORNER_PETALS.map(() => 1),
@@ -186,7 +254,7 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
             scalesBuf[i] = petalScale;
           }
 
-          applyFrame(fade, coreScale, deltasBuf, scalesBuf);
+          applyFrame(fade, coreScale, 0, 0, 1, deltasBuf, scalesBuf);
           if (t < 1) {
             rafId = requestAnimationFrame(step);
           }
@@ -199,6 +267,9 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
         applyFrame(
           0,
           0.55,
+          0,
+          0,
+          1,
           LAUNCH_CORNER_PETALS.map((p) => LAUNCH_ORIGIN_ANG - p.ang),
           LAUNCH_CORNER_PETALS.map(() => 0.92),
         );
@@ -207,8 +278,11 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
         startEnter();
       }
     } else {
+      // 退场：原地保持逆时针方向旋转并缩小至消失（完整 12 瓣一并收缩）
       const fromFade = snapRef.current.fade;
       const fromCore = snapRef.current.coreScale;
+      const fromHubRot = snapRef.current.hubRot;
+      const fromHubScale = snapRef.current.hubScale;
       const fromDeltas = snapRef.current.deltas.slice();
       const fromScales = snapRef.current.scales.slice();
 
@@ -216,20 +290,12 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
       const step = (now: number) => {
         if (cancelled) return;
         const t = clamp01((now - startTs) / LAUNCH_EXIT_DURATION_MS);
-        const fade = fromFade * (1 - EASE_IN(clamp01((t - 0.62) / 0.38)));
-        const coreScale = lerp(fromCore, 0.5, EASE_IN(clamp01(t / 0.85)));
+        const e = EASE_IN(t);
+        const fade = fromFade * (1 - EASE_IN(clamp01((t - 0.45) / 0.55)));
+        const hubRot = lerp(fromHubRot, LAUNCH_EXIT_ROT_DEG, e);
+        const hubScale = lerp(fromHubScale, 0, e);
 
-        for (let i = 0; i < count; i++) {
-          const spec = LAUNCH_CORNER_PETALS[i];
-          const endDelta = LAUNCH_EXIT_ANG - spec.ang;
-          const delay = (i / count) * 0.24;
-          const u = clamp01((t - delay) / (1 - delay));
-          const eased = EASE_IN(u);
-          deltasBuf[i] = lerp(fromDeltas[i], endDelta, eased);
-          scalesBuf[i] = lerp(fromScales[i], 0.9, eased);
-        }
-
-        applyFrame(fade, coreScale, deltasBuf, scalesBuf);
+        applyFrame(fade, fromCore, 0, hubRot, hubScale, fromDeltas, fromScales);
         if (t < 1) {
           rafId = requestAnimationFrame(step);
         } else {
@@ -251,8 +317,14 @@ function LaunchBackdrop({ enterDelayMs }: { enterDelayMs: number }) {
       <div className="backdrop-claude-wrap">
         <svg className="backdrop-claude-svg" viewBox="0 0 180 180" fill="none">
           <g ref={layerRef}>
-            <g transform="translate(162 162)">
-              <circle ref={coreRef} cx={0} cy={0} r={30.2} fill="currentColor" />
+            <g ref={hubRef} transform="translate(162 162)">
+              {/* 中心圆与右侧紧邻两瓣（静止时完全藏于中心圆内，退场整体逆时针旋转时自然补齐右缘不露缺口） */}
+              <g ref={coreRef}>
+                <circle cx={0} cy={0} r={30.2} fill="currentColor" />
+                {LAUNCH_EXTRA_EXIT_PETALS.map((petal) => (
+                  <path key={petal.k} d={petal.d} fill="currentColor" />
+                ))}
+              </g>
               <g>
                 {LAUNCH_CORNER_PETALS.map((petal, idx) => (
                   <g
