@@ -5,7 +5,7 @@
   "version": "0.2.0",
   "identifier": "dev.xanerix.clade",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": "bun --bun vite",
     "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": "bun run build",
     "beforeBundleCommand": "cargo build --manifest-path src-tauri/Cargo.toml --release --bin clade",

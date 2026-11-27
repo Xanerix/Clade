@@ -1,8 +1,9 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, type Variants } from "motion/react";
 import {
+  CARD_VARIANTS,
   COLLAPSE_VARIANTS,
   EASE_EDITORIAL,
   MODAL_VARIANTS,
@@ -149,17 +150,7 @@ export function ModalDialog({
   );
 }
 
-export const CheckIcon = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-    <polyline points="20 6 9 17 4 12" />
-  </svg>
-);
-
-export const MinusIcon = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
-    <line x1="5" y1="12" x2="19" y2="12" />
-  </svg>
-);
+export { CheckIcon, MinusIcon } from "./icons";
 
 const pad = (n: number) => String(n).padStart(2, "0");
 export const fmtTime = (d: Date) =>
@@ -440,10 +431,12 @@ export function SwitchGroups({
   defs,
   value,
   onChange,
+  cardVariants = CARD_VARIANTS,
 }: {
   defs: SwitchDef[];
   value: Switches;
   onChange: (v: Switches) => void;
+  cardVariants?: Variants;
 }) {
   const groups = [...new Set(defs.map((d) => d.group))];
   const set = (key: string, v: Switch | null) => {
@@ -458,7 +451,7 @@ export function SwitchGroups({
       {groups.map((g) => {
         const items = defs.filter((d) => d.group === g);
         return (
-          <div key={g} className="settings-group-block">
+          <motion.div key={g} className="settings-group-block" variants={cardVariants}>
             <h3 className="settings-group-h">{g}</h3>
             <div className="set-card">
               {items.map((d) => (
@@ -472,7 +465,7 @@ export function SwitchGroups({
                 />
               ))}
             </div>
-          </div>
+          </motion.div>
         );
       })}
     </>
