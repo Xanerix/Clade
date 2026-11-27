@@ -8,6 +8,113 @@ use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
+/// 判断是否为 Anthropic 托管的 WebSearch 服务端工具（如 `web_search_20250305`）。
+pub fn is_anthropic_web_search_tool(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t == "web_search" || t.starts_with("web_search_"))
+}
+
+/// 从 Anthropic 请求体中提取托管 WebSearch 工具的名称（优先匹配被 `tool_choice` 指定的名称）。
+pub fn anthropic_web_search_tool_name(body: &Value) -> Option<&str> {
+    let tools = body.get("tools").and_then(Value::as_array)?;
+    let forced = body
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .filter(|tc| tc.get("type").and_then(Value::as_str) == Some("tool"))
+        .and_then(|tc| tc.get("name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = forced
+        && tools
+            .iter()
+            .any(|t| is_anthropic_web_search_tool(t) && t.get("name").and_then(Value::as_str) == Some(name))
+    {
+        return Some(name);
+    }
+    tools
+        .iter()
+        .find(|t| is_anthropic_web_search_tool(t))
+        .and_then(|t| t.get("name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+fn make_web_search_result(url: &str, title: Option<&str>, page_age: Option<&Value>) -> Value {
+    let title = title.filter(|t| !t.is_empty()).unwrap_or(url);
+    let page_age = page_age.filter(|v| v.is_string()).cloned().unwrap_or(Value::Null);
+    json!({
+        "type": "web_search_result",
+        "url": url,
+        "title": title,
+        "encrypted_content": "",
+        "page_age": page_age,
+    })
+}
+
+fn merge_web_search_results(target: &mut Vec<Value>, incoming: Vec<Value>) {
+    for item in incoming {
+        let Some(url) = item.get("url").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|r| r.get("url").and_then(Value::as_str) == Some(url))
+        {
+            let cur_title = existing.get("title").and_then(Value::as_str).unwrap_or("");
+            if (cur_title.is_empty() || cur_title == url)
+                && let Some(new_title) = item.get("title").and_then(Value::as_str).filter(|t| !t.is_empty() && *t != url)
+            {
+                existing["title"] = json!(new_title);
+            }
+            if existing.get("page_age").is_none_or(Value::is_null)
+                && let Some(age) = item.get("page_age").filter(|v| v.is_string())
+            {
+                existing["page_age"] = age.clone();
+            }
+        } else {
+            target.push(item);
+        }
+    }
+}
+
+fn attach_web_search_usage(usage: &mut Value, web_search_requests: u64) {
+    if web_search_requests > 0
+        && let Some(obj) = usage.as_object_mut()
+    {
+        obj.insert(
+            "server_tool_use".into(),
+            json!({ "web_search_requests": web_search_requests }),
+        );
+    }
+}
+
+/// 将历史消息中的 `web_search_tool_result` 块转成简洁文本，供不支持原生回放的上游协议使用。
+fn summarize_web_search_result_block(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::Array(items)) => {
+            let lines: Vec<String> = items
+                .iter()
+                .filter_map(|it| {
+                    let url = it.get("url").and_then(Value::as_str)?;
+                    let title = it.get("title").and_then(Value::as_str).unwrap_or(url);
+                    Some(format!("- {title}: {url}"))
+                })
+                .collect();
+            if lines.is_empty() {
+                String::new()
+            } else {
+                format!("[Web search results]\n{}", lines.join("\n"))
+            }
+        }
+        Some(Value::Object(err)) => {
+            let code = err.get("error_code").and_then(Value::as_str).unwrap_or("error");
+            format!("[Web search error: {code}]")
+        }
+        _ => String::new(),
+    }
+}
+
 /// 判断模型名是否属于 OpenAI o1/o3/o4 推理系列（需使用 max_completion_tokens）。
 fn is_o_series(model: &str) -> bool {
     let name = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
@@ -280,8 +387,14 @@ fn convert_message(msg: &Value) -> Vec<Value> {
                     tool_media_parts.extend(images);
                 }
             }
-            // thinking / redacted_thinking 在请求里直接丢弃
-            "thinking" | "redacted_thinking" => {}
+            // thinking / redacted_thinking 在请求里直接丢弃；历史 web_search 结果保留为简洁文本
+            "thinking" | "redacted_thinking" | "server_tool_use" => {}
+            "web_search_tool_result" => {
+                let summary = summarize_web_search_result_block(block);
+                if !summary.is_empty() {
+                    parts.push(json!({"type": "text", "text": summary}));
+                }
+            }
             _ => {}
         }
     }
@@ -403,12 +516,17 @@ pub fn anthropic_to_openai_chat(body: &Value) -> Result<Value> {
         }
     }
 
-    // tools
+    // tools（Chat Completions 不支持 Anthropic 托管 web_search，直接过滤避免生成空函数）
+    let mut dropped_web_search_names: Vec<&str> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         let openai_tools: Vec<Value> = tools
             .iter()
             .filter_map(|t| {
                 let name = t.get("name").and_then(Value::as_str)?;
+                if is_anthropic_web_search_tool(t) {
+                    dropped_web_search_names.push(name);
+                    return None;
+                }
                 let mut func = Map::new();
                 func.insert("name".into(), json!(name));
                 if let Some(desc) = t.get("description").and_then(Value::as_str)
@@ -429,8 +547,15 @@ pub fn anthropic_to_openai_chat(body: &Value) -> Result<Value> {
         }
     }
 
-    // tool_choice
-    if let Some(tc) = body.get("tool_choice").and_then(map_tool_choice) {
+    // tool_choice（若指向已过滤掉的 web_search，则不发送）
+    let tc_points_to_dropped = body
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .filter(|o| o.get("type").and_then(Value::as_str) == Some("tool"))
+        .and_then(|o| o.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(|n| dropped_web_search_names.contains(&n));
+    if !tc_points_to_dropped && let Some(tc) = body.get("tool_choice").and_then(map_tool_choice) {
         result.insert("tool_choice".into(), tc);
     }
 
@@ -1095,7 +1220,7 @@ fn tool_result_to_responses_output(content: Option<&Value>) -> Value {
     }
 }
 
-fn map_tool_choice_responses(tc: &Value) -> Option<Value> {
+fn map_tool_choice_responses(tc: &Value, web_search_names: &[&str], is_codex_oauth: bool) -> Option<Value> {
     match tc {
         Value::String(s) => match s.as_str() {
             "auto" => Some(json!("auto")),
@@ -1109,12 +1234,112 @@ fn map_tool_choice_responses(tc: &Value) -> Option<Value> {
             Some("none") => Some(json!("none")),
             Some("tool") => {
                 let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
-                Some(json!({ "type": "function", "name": name }))
+                if web_search_names.contains(&name) {
+                    if is_codex_oauth {
+                        Some(json!("required"))
+                    } else {
+                        Some(json!({ "type": "web_search" }))
+                    }
+                } else {
+                    Some(json!({ "type": "function", "name": name }))
+                }
             }
             _ => None,
         },
         _ => None,
     }
+}
+
+fn build_responses_web_search_tool(tool: &Value, is_codex_oauth: bool) -> Value {
+    let mut obj = Map::new();
+    obj.insert("type".into(), json!("web_search"));
+    if is_codex_oauth {
+        obj.insert("external_web_access".into(), json!(true));
+    }
+    let mut filters = Map::new();
+    if let Some(allowed) = tool
+        .get("allowed_domains")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+    {
+        filters.insert("allowed_domains".into(), Value::Array(allowed.clone()));
+    }
+    if !is_codex_oauth
+        && let Some(blocked) = tool
+            .get("blocked_domains")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+    {
+        filters.insert("blocked_domains".into(), Value::Array(blocked.clone()));
+    }
+    if !filters.is_empty() {
+        obj.insert("filters".into(), Value::Object(filters));
+    }
+    if let Some(loc) = tool.get("user_location").filter(|v| v.is_object()) {
+        obj.insert("user_location".into(), loc.clone());
+    }
+    Value::Object(obj)
+}
+
+fn responses_web_search_action_input(item: &Value) -> Value {
+    if let Some(query) = item.pointer("/action/query").and_then(Value::as_str) {
+        return json!({ "query": query });
+    }
+    if let Some(queries) = item.pointer("/action/queries").and_then(Value::as_array)
+        && let Some(first) = queries.iter().find_map(Value::as_str)
+    {
+        return json!({ "query": first });
+    }
+    if let Some(url) = item.pointer("/action/url").and_then(Value::as_str) {
+        return json!({ "query": url });
+    }
+    json!({})
+}
+
+fn responses_web_search_results_from_action(item: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(sources) = item.pointer("/action/sources").and_then(Value::as_array) else {
+        return out;
+    };
+    for s in sources {
+        if let Some(url) = s.get("url").and_then(Value::as_str).filter(|u| !u.is_empty()) {
+            let title = s.get("title").and_then(Value::as_str);
+            merge_web_search_results(&mut out, vec![make_web_search_result(url, title, s.get("page_age"))]);
+        }
+    }
+    out
+}
+
+fn responses_web_search_results_from_annotations(annotations: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for ann in annotations {
+        if ann.get("type").and_then(Value::as_str) != Some("url_citation") {
+            continue;
+        }
+        if let Some(url) = ann.get("url").and_then(Value::as_str).filter(|u| !u.is_empty()) {
+            let title = ann.get("title").and_then(Value::as_str);
+            merge_web_search_results(&mut out, vec![make_web_search_result(url, title, None)]);
+        }
+    }
+    out
+}
+
+fn responses_web_search_error(item: &Value) -> Option<Value> {
+    let failed = item.get("status").and_then(Value::as_str) == Some("failed")
+        || item.get("error").is_some_and(|e| !e.is_null());
+    if !failed {
+        return None;
+    }
+    let code = item
+        .pointer("/error/code")
+        .or_else(|| item.pointer("/error/type"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unavailable");
+    Some(json!({
+        "type": "web_search_tool_result_error",
+        "error_code": code,
+    }))
 }
 
 fn map_responses_usage(usage: Option<&Value>) -> Value {
@@ -1156,6 +1381,10 @@ fn map_responses_stop_reason(status: Option<&str>, has_tool_use: bool, incomplet
 
 /// Anthropic Messages 请求体 → OpenAI Responses 请求体。
 pub fn anthropic_to_openai_responses(body: &Value) -> Result<Value> {
+    anthropic_to_openai_responses_inner(body, false)
+}
+
+fn anthropic_to_openai_responses_inner(body: &Value, is_codex_oauth: bool) -> Result<Value> {
     let mut result = Map::new();
 
     if let Some(model) = body.get("model").and_then(Value::as_str).filter(|s| !s.is_empty()) {
@@ -1234,7 +1463,13 @@ pub fn anthropic_to_openai_responses(body: &Value) -> Result<Value> {
                                     "output": output,
                                 }));
                             }
-                            "thinking" | "redacted_thinking" => {}
+                            "thinking" | "redacted_thinking" | "server_tool_use" => {}
+                            "web_search_tool_result" => {
+                                let summary = summarize_web_search_result_block(block);
+                                if !summary.is_empty() {
+                                    parts.push(json!({ "type": text_type, "text": summary }));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1267,32 +1502,71 @@ pub fn anthropic_to_openai_responses(body: &Value) -> Result<Value> {
         result.insert("stream".into(), v.clone());
     }
 
-    // tools（扁平结构，显式 strict: false 保留可选参数语义）
+    // tools（普通函数扁平结构 + Anthropic 托管 web_search → Responses web_search）
+    let mut web_search_names: Vec<&str> = Vec::new();
+    let mut has_web_search = false;
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let resp_tools: Vec<Value> = tools
-            .iter()
-            .filter_map(|t| {
-                let name = t.get("name").and_then(Value::as_str)?;
-                let mut tool = Map::new();
-                tool.insert("type".into(), json!("function"));
-                tool.insert("name".into(), json!(name));
-                tool.insert("strict".into(), json!(false));
-                if let Some(desc) = t.get("description").and_then(Value::as_str)
-                    && !desc.is_empty()
-                {
-                    tool.insert("description".into(), json!(desc));
+        let mut resp_tools: Vec<Value> = Vec::new();
+        for t in tools {
+            if is_anthropic_web_search_tool(t) {
+                if let Some(name) = t.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    web_search_names.push(name);
                 }
-                let schema = t.get("input_schema").cloned().unwrap_or_else(|| json!({}));
-                tool.insert("parameters".into(), clean_schema(schema, true));
-                Some(Value::Object(tool))
-            })
-            .collect();
+                if !has_web_search {
+                    has_web_search = true;
+                    resp_tools.push(build_responses_web_search_tool(t, is_codex_oauth));
+                }
+                continue;
+            }
+            let Some(name) = t.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut tool = Map::new();
+            tool.insert("type".into(), json!("function"));
+            tool.insert("name".into(), json!(name));
+            tool.insert("strict".into(), json!(false));
+            if let Some(desc) = t.get("description").and_then(Value::as_str)
+                && !desc.is_empty()
+            {
+                tool.insert("description".into(), json!(desc));
+            }
+            let schema = t.get("input_schema").cloned().unwrap_or_else(|| json!({}));
+            tool.insert("parameters".into(), clean_schema(schema, true));
+            resp_tools.push(Value::Object(tool));
+        }
+        // Codex OAuth 强制指定 web_search 时，tool_choice 需降级为 "required"，同时过滤无关工具避免误调
+        let forced_ws = is_codex_oauth
+            && body
+                .get("tool_choice")
+                .and_then(Value::as_object)
+                .filter(|o| o.get("type").and_then(Value::as_str) == Some("tool"))
+                .and_then(|o| o.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|n| web_search_names.contains(&n));
+        if forced_ws {
+            resp_tools.retain(|t| t.get("type").and_then(Value::as_str) == Some("web_search"));
+        }
         if !resp_tools.is_empty() {
             result.insert("tools".into(), Value::Array(resp_tools));
         }
     }
 
-    if let Some(tc) = body.get("tool_choice").and_then(map_tool_choice_responses) {
+    if has_web_search {
+        let mut includes: Vec<Value> = body
+            .get("include")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !includes.iter().any(|v| v.as_str() == Some("web_search_call.action.sources")) {
+            includes.push(json!("web_search_call.action.sources"));
+        }
+        result.insert("include".into(), Value::Array(includes));
+    }
+
+    if let Some(tc) = body
+        .get("tool_choice")
+        .and_then(|tc| map_tool_choice_responses(tc, &web_search_names, is_codex_oauth))
+    {
         result.insert("tool_choice".into(), tc);
     }
 
@@ -1312,15 +1586,16 @@ pub fn anthropic_to_openai_responses(body: &Value) -> Result<Value> {
 /// - 删除上游拒绝的参数（`max_output_tokens` / `temperature` / `top_p` 等）
 /// - 兜底必填字段 `instructions` / `tools` / `parallel_tool_calls`
 pub fn anthropic_to_codex_oauth_responses(body: &Value) -> Result<Value> {
-    let mut req = anthropic_to_openai_responses(body)?;
+    let mut req = anthropic_to_openai_responses_inner(body, true)?;
     if let Some(obj) = req.as_object_mut() {
         obj.insert("store".into(), json!(false));
         obj.insert("stream".into(), json!(true));
 
-        let mut includes: Vec<Value> = body
+        let mut includes: Vec<Value> = obj
             .get("include")
             .and_then(Value::as_array)
             .cloned()
+            .or_else(|| body.get("include").and_then(Value::as_array).cloned())
             .unwrap_or_default();
         if !includes.iter().any(|v| v.as_str() == Some("reasoning.encrypted_content")) {
             includes.push(json!("reasoning.encrypted_content"));
@@ -1357,6 +1632,10 @@ pub fn anthropic_to_codex_oauth_responses(body: &Value) -> Result<Value> {
 /// 将 Responses SSE 字节流收集为单个 Anthropic Messages 非流式 JSON 响应。
 /// 用于 ChatGPT Codex OAuth 上游强制流式，但客户端（如分类器 / 标题生成）请求非流式的场景。
 pub fn collect_responses_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
+    collect_responses_sse_to_anthropic_with_web_search(bytes, None)
+}
+
+pub fn collect_responses_sse_to_anthropic_with_web_search(bytes: &[u8], web_search_name: Option<&str>) -> Result<Value> {
     let text = String::from_utf8_lossy(bytes);
     let mut completed: Option<Value> = None;
     let mut current_event = String::new();
@@ -1365,6 +1644,8 @@ pub fn collect_responses_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
     let mut collected_text = String::new();
     // (call_id, name, arguments)
     let mut tools: Vec<(String, String, String)> = Vec::new();
+    let mut web_searches: Vec<Value> = Vec::new();
+    let mut annotations: Vec<Value> = Vec::new();
     let mut usage: Option<Value> = None;
     let mut status: Option<String> = None;
 
@@ -1412,6 +1693,11 @@ pub fn collect_responses_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
                     collected_text.push_str(d);
                 }
             }
+            "response.output_text.annotation.added" => {
+                if let Some(ann) = v.get("annotation") {
+                    annotations.push(ann.clone());
+                }
+            }
             "response.output_item.added" => {
                 if let Some(item) = v.get("item")
                     && item.get("type").and_then(Value::as_str) == Some("function_call")
@@ -1424,6 +1710,13 @@ pub fn collect_responses_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
                         .to_string();
                     let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                     tools.push((call_id, name, String::new()));
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = v.get("item")
+                    && item.get("type").and_then(Value::as_str) == Some("web_search_call")
+                {
+                    web_searches.push(item.clone());
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -1465,10 +1758,42 @@ pub fn collect_responses_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
             || matches!(resp.get("status").and_then(Value::as_str), Some("failed" | "cancelled"))
             || resp.get("error").is_some_and(|e| !e.is_null()))
     {
-        return openai_responses_to_anthropic(&resp);
+        return openai_responses_to_anthropic_with_web_search(&resp, web_search_name);
     }
 
+    let ws_name = web_search_name.filter(|s| !s.is_empty()).unwrap_or("web_search");
+    let ann_results = responses_web_search_results_from_annotations(&annotations);
     let mut content = Vec::new();
+    let ws_count = web_searches.len() as u64;
+    for (idx, item) in web_searches.iter().enumerate() {
+        let sid = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| format!("srvtoolu_{idx}"));
+        let input = responses_web_search_action_input(item);
+        let result_content = if let Some(err) = responses_web_search_error(item) {
+            err
+        } else {
+            let mut results = responses_web_search_results_from_action(item);
+            if idx + 1 == web_searches.len() {
+                merge_web_search_results(&mut results, ann_results.clone());
+            }
+            Value::Array(results)
+        };
+        content.push(json!({
+            "type": "server_tool_use",
+            "id": sid,
+            "name": ws_name,
+            "input": input,
+        }));
+        content.push(json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": sid,
+            "content": result_content,
+        }));
+    }
     if !collected_text.is_empty() {
         content.push(json!({ "type": "text", "text": collected_text }));
     }
@@ -1487,6 +1812,8 @@ pub fn collect_responses_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
         }));
     }
     let stop_reason = map_responses_stop_reason(status.as_deref(), has_tool_use, None);
+    let mut out_usage = map_responses_usage(usage.as_ref());
+    attach_web_search_usage(&mut out_usage, ws_count);
     Ok(json!({
         "id": ensure_msg_id(&id),
         "type": "message",
@@ -1495,12 +1822,16 @@ pub fn collect_responses_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": map_responses_usage(usage.as_ref()),
+        "usage": out_usage,
     }))
 }
 
 /// OpenAI Responses 非流式响应 → Anthropic Messages 响应。
 pub fn openai_responses_to_anthropic(body: &Value) -> Result<Value> {
+    openai_responses_to_anthropic_with_web_search(body, None)
+}
+
+pub fn openai_responses_to_anthropic_with_web_search(body: &Value, web_search_name: Option<&str>) -> Result<Value> {
     let status = body.get("status").and_then(Value::as_str);
     if matches!(status, Some("failed" | "cancelled")) || body.get("error").is_some_and(|e| !e.is_null()) {
         let msg = body
@@ -1515,12 +1846,68 @@ pub fn openai_responses_to_anthropic(body: &Value) -> Result<Value> {
         bail!("OpenAI Responses 响应里没有 output");
     };
 
+    // 先收集 message 里的 url_citation 注解，补全 web_search_call 缺失的标题或回退来源
+    let mut citation_results: Vec<Value> = Vec::new();
+    let mut last_ok_ws_idx: Option<usize> = None;
+    for (idx, item) in output.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("web_search_call") if responses_web_search_error(item).is_none() => {
+                last_ok_ws_idx = Some(idx);
+            }
+            Some("message") => {
+                if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        if let Some(anns) = part.get("annotations").and_then(Value::as_array) {
+                            merge_web_search_results(
+                                &mut citation_results,
+                                responses_web_search_results_from_annotations(anns),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ws_name = web_search_name.filter(|s| !s.is_empty()).unwrap_or("web_search");
     let mut content = Vec::new();
     let mut has_tool_use = false;
+    let mut web_search_requests: u64 = 0;
 
     for (idx, item) in output.iter().enumerate() {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         match item_type {
+            "web_search_call" => {
+                web_search_requests += 1;
+                let sid = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("srvtoolu_{idx}"));
+                let input = responses_web_search_action_input(item);
+                let result_content = if let Some(err) = responses_web_search_error(item) {
+                    err
+                } else {
+                    let mut results = responses_web_search_results_from_action(item);
+                    if last_ok_ws_idx == Some(idx) {
+                        merge_web_search_results(&mut results, citation_results.clone());
+                    }
+                    Value::Array(results)
+                };
+                content.push(json!({
+                    "type": "server_tool_use",
+                    "id": sid,
+                    "name": ws_name,
+                    "input": input,
+                }));
+                content.push(json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": sid,
+                    "content": result_content,
+                }));
+            }
             "message" => {
                 if let Some(parts) = item.get("content").and_then(Value::as_array) {
                     for part in parts {
@@ -1578,7 +1965,8 @@ pub fn openai_responses_to_anthropic(body: &Value) -> Result<Value> {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     let incomplete_reason = body.pointer("/incomplete_details/reason").and_then(Value::as_str);
     let stop_reason = map_responses_stop_reason(status, has_tool_use, incomplete_reason);
-    let usage = map_responses_usage(body.get("usage"));
+    let mut usage = map_responses_usage(body.get("usage"));
+    attach_web_search_usage(&mut usage, web_search_requests);
 
     Ok(json!({
         "id": id,
@@ -1604,10 +1992,14 @@ pub struct ResponsesSseConverter {
     current_event: String,
     message_id: String,
     model: String,
+    web_search_name: String,
     sent_message_start: bool,
     next_block_index: u32,
     active_block: Option<RespActiveBlock>,
     has_tool_use: bool,
+    web_search_count: u64,
+    emitted_web_search_ids: Vec<String>,
+    pending_web_search_annotations: Vec<Value>,
     stop_reason: Option<&'static str>,
     latest_usage: Option<Value>,
     finished: bool,
@@ -1622,15 +2014,25 @@ impl Default for ResponsesSseConverter {
 
 impl ResponsesSseConverter {
     pub fn new() -> Self {
+        Self::with_web_search_name(None)
+    }
+
+    pub fn with_web_search_name(web_search_name: Option<String>) -> Self {
         Self {
             buf: Vec::new(),
             current_event: String::new(),
             message_id: String::new(),
             model: String::new(),
+            web_search_name: web_search_name
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "web_search".to_string()),
             sent_message_start: false,
             next_block_index: 0,
             active_block: None,
             has_tool_use: false,
+            web_search_count: 0,
+            emitted_web_search_ids: Vec::new(),
+            pending_web_search_annotations: Vec::new(),
             stop_reason: None,
             latest_usage: None,
             finished: false,
@@ -1820,7 +2222,22 @@ impl ResponsesSseConverter {
                 }
             }
 
+            "response.output_text.annotation.added" => {
+                if let Some(ann) = data.get("annotation") {
+                    merge_web_search_results(
+                        &mut self.pending_web_search_annotations,
+                        responses_web_search_results_from_annotations(std::slice::from_ref(ann)),
+                    );
+                }
+            }
+
             "response.content_part.done" => {
+                if let Some(anns) = data.pointer("/part/annotations").and_then(Value::as_array) {
+                    merge_web_search_results(
+                        &mut self.pending_web_search_annotations,
+                        responses_web_search_results_from_annotations(anns),
+                    );
+                }
                 if matches!(self.active_block, Some(RespActiveBlock::Text { .. })) {
                     self.close_active_block(out);
                 }
@@ -1923,6 +2340,10 @@ impl ResponsesSseConverter {
                         }
                         self.close_active_block(out);
                     }
+                } else if item_type == Some("web_search_call") {
+                    if let Some(item) = item {
+                        self.emit_web_search_item(item, None, out);
+                    }
                 } else if item_type == Some("message") && matches!(self.active_block, Some(RespActiveBlock::Text { .. })) {
                     self.close_active_block(out);
                 }
@@ -1930,6 +2351,41 @@ impl ResponsesSseConverter {
 
             "response.completed" | "response.incomplete" => {
                 let resp = data.get("response").unwrap_or(data);
+                if let Some(output) = resp.get("output").and_then(Value::as_array) {
+                    // 收集终态 output 中可能补齐的 url_citation，以及未在 item.done 出现的 web_search_call
+                    let mut final_citations = std::mem::take(&mut self.pending_web_search_annotations);
+                    for item in output {
+                        if item.get("type").and_then(Value::as_str) == Some("message")
+                            && let Some(parts) = item.get("content").and_then(Value::as_array)
+                        {
+                            for part in parts {
+                                if let Some(anns) = part.get("annotations").and_then(Value::as_array) {
+                                    merge_web_search_results(
+                                        &mut final_citations,
+                                        responses_web_search_results_from_annotations(anns),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let unemitted: Vec<&Value> = output
+                        .iter()
+                        .filter(|it| it.get("type").and_then(Value::as_str) == Some("web_search_call"))
+                        .filter(|it| {
+                            it.get("id")
+                                .and_then(Value::as_str)
+                                .is_none_or(|id| !self.emitted_web_search_ids.iter().any(|e| e == id))
+                        })
+                        .collect();
+                    for (i, item) in unemitted.iter().enumerate() {
+                        let extra = if i + 1 == unemitted.len() {
+                            Some(final_citations.as_slice())
+                        } else {
+                            None
+                        };
+                        self.emit_web_search_item(item, extra, out);
+                    }
+                }
                 if let Some(u) = resp.get("usage").filter(|u| u.is_object()) {
                     self.latest_usage = Some(map_responses_usage(Some(u)));
                 }
@@ -2029,6 +2485,83 @@ impl ResponsesSseConverter {
         }
     }
 
+    fn emit_web_search_item(&mut self, item: &Value, extra_results: Option<&[Value]>, out: &mut Vec<String>) {
+        let sid = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| format!("srvtoolu_{}", self.web_search_count));
+        if self.emitted_web_search_ids.iter().any(|id| id == &sid) {
+            return;
+        }
+        self.emitted_web_search_ids.push(sid.clone());
+        self.web_search_count += 1;
+
+        self.emit_message_start(None, out);
+        self.close_active_block(out);
+
+        let input = responses_web_search_action_input(item);
+        let use_idx = self.next_block_index;
+        self.next_block_index += 1;
+        out.push(format_sse(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": use_idx,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": sid,
+                    "name": self.web_search_name,
+                    "input": {}
+                }
+            }),
+        ));
+        let partial = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+        if partial != "{}" {
+            out.push(format_sse(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": use_idx,
+                    "delta": { "type": "input_json_delta", "partial_json": partial }
+                }),
+            ));
+        }
+        out.push(format_sse(
+            "content_block_stop",
+            &json!({ "type": "content_block_stop", "index": use_idx }),
+        ));
+
+        let result_content = if let Some(err) = responses_web_search_error(item) {
+            err
+        } else {
+            let mut results = responses_web_search_results_from_action(item);
+            if let Some(extra) = extra_results {
+                merge_web_search_results(&mut results, extra.to_vec());
+            }
+            Value::Array(results)
+        };
+        let res_idx = self.next_block_index;
+        self.next_block_index += 1;
+        out.push(format_sse(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": res_idx,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": sid,
+                    "content": result_content
+                }
+            }),
+        ));
+        out.push(format_sse(
+            "content_block_stop",
+            &json!({ "type": "content_block_stop", "index": res_idx }),
+        ));
+    }
+
     fn emit_final(&mut self, out: &mut Vec<String>) {
         if self.finished {
             return;
@@ -2038,7 +2571,8 @@ impl ResponsesSseConverter {
             self.emit_message_start(None, out);
         }
         self.close_active_block(out);
-        let usage = self.latest_usage.clone().unwrap_or_else(|| map_responses_usage(None));
+        let mut usage = self.latest_usage.clone().unwrap_or_else(|| map_responses_usage(None));
+        attach_web_search_usage(&mut usage, self.web_search_count);
         let stop_reason = self.stop_reason.unwrap_or(if self.has_tool_use { "tool_use" } else { "end_turn" });
         out.push(format_sse(
             "message_delta",
@@ -2059,8 +2593,15 @@ impl ResponsesSseConverter {
 pub fn openai_responses_sse_to_anthropic_sse<E: std::fmt::Display + Send + 'static>(
     upstream: impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
+    openai_responses_sse_to_anthropic_sse_with_web_search(upstream, None)
+}
+
+pub fn openai_responses_sse_to_anthropic_sse_with_web_search<E: std::fmt::Display + Send + 'static>(
+    upstream: impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    web_search_name: Option<String>,
+) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut conv = ResponsesSseConverter::new();
+        let mut conv = ResponsesSseConverter::with_web_search_name(web_search_name);
         tokio::pin!(upstream);
 
         while let Some(item) = upstream.next().await {
@@ -2395,7 +2936,13 @@ pub fn anthropic_to_gemini(body: &Value) -> Result<Value> {
                                     }
                                 }
                             }
-                            "thinking" | "redacted_thinking" => {}
+                            "thinking" | "redacted_thinking" | "server_tool_use" => {}
+                            "web_search_tool_result" => {
+                                let summary = summarize_web_search_result_block(block);
+                                if !summary.is_empty() {
+                                    parts.push(json!({ "text": summary }));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -2445,37 +2992,116 @@ pub fn anthropic_to_gemini(body: &Value) -> Result<Value> {
         result.insert("generationConfig".into(), Value::Object(gen_cfg));
     }
 
-    // tools
+    // tools：区分普通函数工具与 Anthropic 托管 web_search 工具。
+    // Google Gemini / Cloud Code Assist v1internal 不允许 googleSearch 与 functionDeclarations 混用，
+    // 仅在请求里只有 web_search 工具（如 Claude Code 内置 WebSearch 专用请求）时启用 googleSearch。
+    let mut web_search_names: Vec<&str> = Vec::new();
+    let mut has_function_decls = false;
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let decls: Vec<Value> = tools
-            .iter()
-            .filter_map(|t| {
-                let name = t.get("name").and_then(Value::as_str)?;
-                let desc = t.get("description").and_then(Value::as_str);
-                let schema = t.get("input_schema").cloned().unwrap_or_else(|| json!({}));
-                Some(build_gemini_function_declaration(name, desc, schema))
-            })
-            .collect();
+        let mut decls: Vec<Value> = Vec::new();
+        for t in tools {
+            if is_anthropic_web_search_tool(t) {
+                if let Some(name) = t.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    web_search_names.push(name);
+                }
+                continue;
+            }
+            let Some(name) = t.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let desc = t.get("description").and_then(Value::as_str);
+            let schema = t.get("input_schema").cloned().unwrap_or_else(|| json!({}));
+            decls.push(build_gemini_function_declaration(name, desc, schema));
+        }
         if !decls.is_empty() {
+            has_function_decls = true;
             result.insert("tools".into(), json!([{ "functionDeclarations": decls }]));
+        } else if !web_search_names.is_empty() {
+            result.insert("tools".into(), json!([{ "googleSearch": {} }]));
         }
     }
 
-    // toolConfig
-    if let Some(tc) = body.get("tool_choice").and_then(map_gemini_tool_choice) {
+    // toolConfig（仅在存在 functionDeclarations 且 tool_choice 不指向 web_search 时下发）
+    let tc_points_to_ws = body
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .filter(|o| o.get("type").and_then(Value::as_str) == Some("tool"))
+        .and_then(|o| o.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(|n| web_search_names.contains(&n));
+    if has_function_decls
+        && !tc_points_to_ws
+        && let Some(tc) = body.get("tool_choice").and_then(map_gemini_tool_choice)
+    {
         result.insert("toolConfig".into(), tc);
     }
 
     Ok(Value::Object(result))
 }
 
+/// 从 Gemini candidate 的 `groundingMetadata` 中提取搜索词与结果链接列表。
+fn extract_gemini_grounding(candidate: &Value, queries: &mut Vec<String>, results: &mut Vec<Value>) {
+    let Some(gm) = candidate.get("groundingMetadata").and_then(Value::as_object) else {
+        return;
+    };
+    if let Some(qs) = gm.get("webSearchQueries").and_then(Value::as_array) {
+        for q in qs {
+            if let Some(s) = q.as_str().map(str::trim).filter(|s| !s.is_empty())
+                && !queries.iter().any(|e| e == s)
+            {
+                queries.push(s.to_string());
+            }
+        }
+    }
+    if let Some(chunks) = gm.get("groundingChunks").and_then(Value::as_array) {
+        for ch in chunks {
+            if let Some(web) = ch.get("web").and_then(Value::as_object)
+                && let Some(uri) = web.get("uri").and_then(Value::as_str).filter(|s| !s.is_empty())
+            {
+                let title = web.get("title").and_then(Value::as_str);
+                merge_web_search_results(results, vec![make_web_search_result(uri, title, None)]);
+            }
+        }
+    }
+}
+
+/// 按 Gemini `groundingMetadata` 构造 Anthropic 的 `server_tool_use` + `web_search_tool_result` 块对。
+fn build_gemini_grounding_blocks(
+    web_search_name: &str,
+    queries: &[String],
+    results: &[Value],
+) -> Option<(Value, Value)> {
+    if queries.is_empty() && results.is_empty() {
+        return None;
+    }
+    let sid = format!("srvtoolu_{}", uuid::Uuid::new_v4().simple());
+    let query = queries.join("; ");
+    let input = if query.is_empty() { json!({}) } else { json!({ "query": query }) };
+    let use_blk = json!({
+        "type": "server_tool_use",
+        "id": sid,
+        "name": web_search_name,
+        "input": input,
+    });
+    let res_blk = json!({
+        "type": "web_search_tool_result",
+        "tool_use_id": sid,
+        "content": Value::Array(results.to_vec()),
+    });
+    Some((use_blk, res_blk))
+}
+
 /// Google Gemini Native 非流式响应 → Anthropic Messages 响应。
 pub fn gemini_to_anthropic(body: &Value) -> Result<Value> {
+    gemini_to_anthropic_with_web_search(body, None)
+}
+
+pub fn gemini_to_anthropic_with_web_search(body: &Value, web_search_name: Option<&str>) -> Result<Value> {
     // Cloud Code Assist (v1internal) 把真实 Gemini 响应包在 {"response": {...}} 里
     let body = body.get("response").filter(|r| r.is_object()).unwrap_or(body);
     let id = ensure_msg_id(body.get("responseId").and_then(Value::as_str).unwrap_or(""));
     let model = body.get("modelVersion").and_then(Value::as_str).unwrap_or("");
-    let usage = map_gemini_usage(body.get("usageMetadata"));
+    let mut usage = map_gemini_usage(body.get("usageMetadata"));
 
     if let Some(reason) = body.pointer("/promptFeedback/blockReason").and_then(Value::as_str) {
         return Ok(json!({
@@ -2496,6 +3122,17 @@ pub fn gemini_to_anthropic(body: &Value) -> Result<Value> {
 
     let mut content = Vec::new();
     let mut has_tool_use = false;
+
+    let mut grounding_queries = Vec::new();
+    let mut grounding_results = Vec::new();
+    extract_gemini_grounding(candidate, &mut grounding_queries, &mut grounding_results);
+    let ws_name = web_search_name.filter(|s| !s.is_empty()).unwrap_or("web_search");
+    let mut ws_count = 0u64;
+    if let Some((use_blk, res_blk)) = build_gemini_grounding_blocks(ws_name, &grounding_queries, &grounding_results) {
+        content.push(use_blk);
+        content.push(res_blk);
+        ws_count = 1;
+    }
 
     if let Some(parts) = candidate.pointer("/content/parts").and_then(Value::as_array) {
         for part in parts {
@@ -2546,6 +3183,7 @@ pub fn gemini_to_anthropic(body: &Value) -> Result<Value> {
     }
 
     let stop_reason = map_gemini_stop_reason(candidate.get("finishReason").and_then(Value::as_str), has_tool_use, false);
+    attach_web_search_usage(&mut usage, ws_count);
 
     Ok(json!({
         "id": id,
@@ -2563,6 +3201,10 @@ pub fn gemini_to_anthropic(body: &Value) -> Result<Value> {
 /// 用于 Antigravity 上游统一走 `v1internal:streamGenerateContent?alt=sse`（与原版 agy CLI 一致），
 /// 同时兼容客户端请求 `stream: false` 的场景。
 pub fn collect_gemini_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
+    collect_gemini_sse_to_anthropic_with_web_search(bytes, None)
+}
+
+pub fn collect_gemini_sse_to_anthropic_with_web_search(bytes: &[u8], web_search_name: Option<&str>) -> Result<Value> {
     let text = String::from_utf8_lossy(bytes);
     let mut id = String::new();
     let mut model = String::new();
@@ -2570,6 +3212,8 @@ pub fn collect_gemini_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
     let mut thinking_sig = String::new();
     let mut acc_text = String::new();
     let mut tools: Vec<Value> = Vec::new();
+    let mut grounding_queries: Vec<String> = Vec::new();
+    let mut grounding_results: Vec<Value> = Vec::new();
     let mut finish_reason: Option<String> = None;
     let mut latest_usage: Option<Value> = None;
 
@@ -2604,6 +3248,7 @@ pub fn collect_gemini_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
             latest_usage = Some(u.clone());
         }
         if let Some(cand) = chunk.get("candidates").and_then(Value::as_array).and_then(|c| c.first()) {
+            extract_gemini_grounding(cand, &mut grounding_queries, &mut grounding_results);
             if let Some(parts) = cand.pointer("/content/parts").and_then(Value::as_array) {
                 for p in parts {
                     if p.get("thought").and_then(Value::as_bool) == Some(true) {
@@ -2661,12 +3306,21 @@ pub fn collect_gemini_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
         }
         content.push(blk);
     }
+    let ws_name = web_search_name.filter(|s| !s.is_empty()).unwrap_or("web_search");
+    let mut ws_count = 0u64;
+    if let Some((use_blk, res_blk)) = build_gemini_grounding_blocks(ws_name, &grounding_queries, &grounding_results) {
+        content.push(use_blk);
+        content.push(res_blk);
+        ws_count = 1;
+    }
     if !acc_text.is_empty() {
         content.push(json!({ "type": "text", "text": acc_text }));
     }
     let has_tool_use = !tools.is_empty();
     content.extend(tools);
     let stop_reason = map_gemini_stop_reason(finish_reason.as_deref(), has_tool_use, false);
+    let mut usage = map_gemini_usage(latest_usage.as_ref());
+    attach_web_search_usage(&mut usage, ws_count);
     Ok(json!({
         "id": ensure_msg_id(&id),
         "type": "message",
@@ -2675,7 +3329,7 @@ pub fn collect_gemini_sse_to_anthropic(bytes: &[u8]) -> Result<Value> {
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": map_gemini_usage(latest_usage.as_ref()),
+        "usage": usage,
     }))
 }
 
@@ -2692,17 +3346,22 @@ enum GeminiActiveBlock {
     Text(u32),
 }
 
-/// 增量 Google Gemini SSE → Anthropic SSE 状态机，支持任意字节分块、思考块与增量/累积文本。
+/// 增量 Google Gemini SSE → Anthropic SSE 状态机，支持任意字节分块、思考块、grounding 联网搜索与增量/累积文本。
 pub struct GeminiSseConverter {
     buf: Vec<u8>,
     message_id: String,
     model: String,
+    /// 请求携带了托管 web_search 时非空；开启时会缓冲可见文本，待终包 groundingMetadata 到达后按
+    /// `server_tool_use` → `web_search_tool_result` → `text` 的 Anthropic 标准顺序输出。
+    hosted_web_search_name: Option<String>,
     sent_message_start: bool,
     next_block_index: u32,
     active_block: Option<GeminiActiveBlock>,
     accumulated_thinking: String,
     accumulated_text: String,
     tool_calls: Vec<GeminiToolSnap>,
+    grounding_queries: Vec<String>,
+    grounding_results: Vec<Value>,
     latest_usage: Option<Value>,
     finish_reason: Option<String>,
     blocked_text: Option<String>,
@@ -2718,16 +3377,23 @@ impl Default for GeminiSseConverter {
 
 impl GeminiSseConverter {
     pub fn new() -> Self {
+        Self::with_web_search_name(None)
+    }
+
+    pub fn with_web_search_name(web_search_name: Option<String>) -> Self {
         Self {
             buf: Vec::new(),
             message_id: String::new(),
             model: String::new(),
+            hosted_web_search_name: web_search_name.filter(|s| !s.is_empty()),
             sent_message_start: false,
             next_block_index: 0,
             active_block: None,
             accumulated_thinking: String::new(),
             accumulated_text: String::new(),
             tool_calls: Vec::new(),
+            grounding_queries: Vec::new(),
+            grounding_results: Vec::new(),
             latest_usage: None,
             finish_reason: None,
             blocked_text: None,
@@ -2878,6 +3544,7 @@ impl GeminiSseConverter {
         let Some(candidate) = chunk.get("candidates").and_then(Value::as_array).and_then(|c| c.first()) else {
             return;
         };
+        extract_gemini_grounding(candidate, &mut self.grounding_queries, &mut self.grounding_results);
         if let Some(fr) = candidate.get("finishReason").and_then(Value::as_str).filter(|s| !s.is_empty()) {
             self.finish_reason = Some(fr.to_string());
         }
@@ -2939,6 +3606,7 @@ impl GeminiSseConverter {
         }
 
         // 2. 提取可见文本（跳过 thought: true）→ Anthropic text / text_delta
+        // 托管 web_search 模式下先缓冲正文，等终包 groundingMetadata 到达后再按标准顺序吐出
         let visible_text: String = parts
             .iter()
             .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
@@ -2948,15 +3616,17 @@ impl GeminiSseConverter {
             let is_cumulative = !self.accumulated_text.is_empty() && visible_text.starts_with(&self.accumulated_text);
             let delta = if is_cumulative { &visible_text[self.accumulated_text.len()..] } else { visible_text.as_str() };
             if !delta.is_empty() {
-                let idx = self.ensure_text_block(out);
-                out.push(format_sse(
-                    "content_block_delta",
-                    &json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": { "type": "text_delta", "text": delta }
-                    }),
-                ));
+                if self.hosted_web_search_name.is_none() {
+                    let idx = self.ensure_text_block(out);
+                    out.push(format_sse(
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": { "type": "text_delta", "text": delta }
+                        }),
+                    ));
+                }
                 if is_cumulative {
                     self.accumulated_text = visible_text;
                 } else {
@@ -3106,6 +3776,75 @@ impl GeminiSseConverter {
 
         self.close_active_block(out);
 
+        let ws_name = self.hosted_web_search_name.as_deref().unwrap_or("web_search");
+        let mut ws_count = 0u64;
+        if let Some((use_blk, res_blk)) =
+            build_gemini_grounding_blocks(ws_name, &self.grounding_queries, &self.grounding_results)
+        {
+            ws_count = 1;
+            let use_idx = self.next_block_index;
+            self.next_block_index += 1;
+            let sid = use_blk["id"].as_str().unwrap_or("");
+            let input_json = serde_json::to_string(&use_blk["input"]).unwrap_or_else(|_| "{}".into());
+            out.push(format_sse(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": use_idx,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": sid,
+                        "name": ws_name,
+                        "input": {}
+                    }
+                }),
+            ));
+            if input_json != "{}" {
+                out.push(format_sse(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": use_idx,
+                        "delta": { "type": "input_json_delta", "partial_json": input_json }
+                    }),
+                ));
+            }
+            out.push(format_sse(
+                "content_block_stop",
+                &json!({ "type": "content_block_stop", "index": use_idx }),
+            ));
+
+            let res_idx = self.next_block_index;
+            self.next_block_index += 1;
+            out.push(format_sse(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": res_idx,
+                    "content_block": res_blk
+                }),
+            ));
+            out.push(format_sse(
+                "content_block_stop",
+                &json!({ "type": "content_block_stop", "index": res_idx }),
+            ));
+        }
+
+        // 托管 web_search 模式下缓冲的正文在搜索结果块之后吐出
+        if self.hosted_web_search_name.is_some() && !self.accumulated_text.is_empty() {
+            let text = self.accumulated_text.clone();
+            let idx = self.ensure_text_block(out);
+            out.push(format_sse(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": { "type": "text_delta", "text": text }
+                }),
+            ));
+            self.close_active_block(out);
+        }
+
         for tc in &self.tool_calls {
             let idx = self.next_block_index;
             self.next_block_index += 1;
@@ -3144,7 +3883,8 @@ impl GeminiSseConverter {
             !self.tool_calls.is_empty(),
             self.blocked_text.is_some(),
         );
-        let usage = self.latest_usage.clone().unwrap_or_else(|| map_gemini_usage(None));
+        let mut usage = self.latest_usage.clone().unwrap_or_else(|| map_gemini_usage(None));
+        attach_web_search_usage(&mut usage, ws_count);
         out.push(format_sse(
             "message_delta",
             &json!({
@@ -3165,15 +3905,23 @@ impl GeminiSseConverter {
 pub fn gemini_sse_to_anthropic_sse<E: std::fmt::Display + Send + 'static>(
     upstream: impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
 ) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
-    gemini_sse_to_anthropic_sse_with_keepalive(upstream, None)
+    gemini_sse_to_anthropic_sse_with_options(upstream, None, None)
 }
 
 pub fn gemini_sse_to_anthropic_sse_with_keepalive<E: std::fmt::Display + Send + 'static>(
     upstream: impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
     keepalive: Option<std::time::Duration>,
 ) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
+    gemini_sse_to_anthropic_sse_with_options(upstream, keepalive, None)
+}
+
+pub fn gemini_sse_to_anthropic_sse_with_options<E: std::fmt::Display + Send + 'static>(
+    upstream: impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    keepalive: Option<std::time::Duration>,
+    web_search_name: Option<String>,
+) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut conv = GeminiSseConverter::new();
+        let mut conv = GeminiSseConverter::with_web_search_name(web_search_name);
         tokio::pin!(upstream);
 
         loop {
@@ -4078,5 +4826,204 @@ mod tests {
             msgs[3]["content"][3],
             json!({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,IMG_DATA_2"}})
         );
+    }
+
+    #[test]
+    fn gemini_web_search_request_and_grounding_response() {
+        // 1. 仅含 web_search_20250305（Claude Code 内置 WebSearch 专用请求）：映射为 googleSearch 且不写 functionCallingConfig
+        let req = json!({
+            "model": "gemini-4-neon-high",
+            "messages": [{"role": "user", "content": "latest rust version"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        });
+        assert_eq!(anthropic_web_search_tool_name(&req), Some("web_search"));
+        let g = anthropic_to_gemini(&req).unwrap();
+        assert_eq!(g["tools"], json!([{ "googleSearch": {} }]));
+        assert!(g.get("toolConfig").is_none());
+
+        // 2. 同时带普通函数与 web_search 时：避免 Gemini/v1internal 400，只发 functionDeclarations
+        let mixed = json!({
+            "model": "gemini-4-neon-high",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "read_file", "description": "读文件", "input_schema": {"type": "object", "properties": {}}}
+            ]
+        });
+        let gm = anthropic_to_gemini(&mixed).unwrap();
+        assert_eq!(gm["tools"][0]["functionDeclarations"][0]["name"], "read_file");
+        assert!(gm["tools"][0].get("googleSearch").is_none());
+
+        // 3. 非流式响应带 groundingMetadata → server_tool_use + web_search_tool_result + text + usage
+        let resp = json!({
+            "response": {
+                "responseId": "g_ws_1",
+                "modelVersion": "gemini-4-neon",
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "Rust 1.100.0 is the latest."}]},
+                    "finishReason": "STOP",
+                    "groundingMetadata": {
+                        "webSearchQueries": ["latest stable rust version"],
+                        "groundingChunks": [
+                            {"web": {"title": "rust-lang.org", "uri": "https://example.com/rust"}},
+                            {"web": {"title": "releases.rs", "uri": "https://example.com/releases"}}
+                        ]
+                    }
+                }],
+                "usageMetadata": {"promptTokenCount": 50, "candidatesTokenCount": 12}
+            }
+        });
+        let anth = gemini_to_anthropic_with_web_search(&resp, Some("web_search")).unwrap();
+        assert_eq!(anth["content"][0]["type"], "server_tool_use");
+        assert_eq!(anth["content"][0]["name"], "web_search");
+        assert_eq!(anth["content"][0]["input"]["query"], "latest stable rust version");
+        let sid = anth["content"][0]["id"].as_str().unwrap();
+        assert_eq!(anth["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(anth["content"][1]["tool_use_id"], sid);
+        assert_eq!(anth["content"][1]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(anth["content"][1]["content"][0]["url"], "https://example.com/rust");
+        assert_eq!(anth["content"][2], json!({"type": "text", "text": "Rust 1.100.0 is the latest."}));
+        assert_eq!(anth["usage"]["server_tool_use"]["web_search_requests"], 1);
+
+        // 4. 流式 SSE 带 groundingMetadata → 产出 server_tool_use + web_search_tool_result 事件与 usage
+        let sse = concat!(
+            "data: {\"response\":{\"responseId\":\"g_ws_2\",\"modelVersion\":\"gemini-4-neon\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"最新是 1.100.0\"}]}}]}}\n\n",
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":{\"webSearchQueries\":[\"rust latest\"],\"groundingChunks\":[{\"web\":{\"title\":\"rust-lang.org\",\"uri\":\"https://example.com/rust\"}}]}}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":5}}}\n\n"
+        );
+        let mut conv = GeminiSseConverter::with_web_search_name(Some("web_search".into()));
+        let mut raw = String::new();
+        for ev in conv.push_bytes(sse.as_bytes()) {
+            raw.push_str(&ev);
+        }
+        for ev in conv.finish() {
+            raw.push_str(&ev);
+        }
+        let events = parse_sse(&raw);
+        let start_types: Vec<&str> = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_start")
+            .filter_map(|(_, v)| v.pointer("/content_block/type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(start_types, vec!["server_tool_use", "web_search_tool_result", "text"]);
+        let delta_ev = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(delta_ev.1["usage"]["server_tool_use"]["web_search_requests"], 1);
+
+        // 5. collect_gemini_sse_to_anthropic 同样保留 grounding 结果
+        let collected = collect_gemini_sse_to_anthropic_with_web_search(sse.as_bytes(), Some("web_search")).unwrap();
+        assert_eq!(collected["content"][0]["type"], "server_tool_use");
+        assert_eq!(collected["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(collected["content"][2]["text"], "最新是 1.100.0");
+    }
+
+    #[test]
+    fn responses_and_chat_web_search_mapping() {
+        let req = json!({
+            "model": "gpt-6-luna",
+            "messages": [{"role": "user", "content": "search rust"}],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "allowed_domains": ["rust-lang.org"],
+                "blocked_domains": ["spam.invalid"]
+            }],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        });
+
+        // 1. OpenAI Responses API
+        let resp_req = anthropic_to_openai_responses(&req).unwrap();
+        assert_eq!(
+            resp_req["tools"][0],
+            json!({
+                "type": "web_search",
+                "filters": {
+                    "allowed_domains": ["rust-lang.org"],
+                    "blocked_domains": ["spam.invalid"]
+                }
+            })
+        );
+        assert_eq!(resp_req["tool_choice"], json!({"type": "web_search"}));
+        assert_eq!(resp_req["include"], json!(["web_search_call.action.sources"]));
+
+        // 2. Codex OAuth Responses
+        let codex_req = anthropic_to_codex_oauth_responses(&req).unwrap();
+        assert_eq!(codex_req["tools"][0]["type"], "web_search");
+        assert_eq!(codex_req["tools"][0]["external_web_access"], true);
+        assert!(codex_req["tools"][0]["filters"].get("blocked_domains").is_none());
+        assert_eq!(codex_req["tool_choice"], "required");
+        let inc = codex_req["include"].as_array().unwrap();
+        assert!(inc.contains(&json!("reasoning.encrypted_content")));
+        assert!(inc.contains(&json!("web_search_call.action.sources")));
+
+        // 3. OpenAI Chat Completions：过滤托管 web_search，不发无效 tool_choice
+        let chat_req = anthropic_to_openai_chat(&req).unwrap();
+        assert!(chat_req.get("tools").is_none());
+        assert!(chat_req.get("tool_choice").is_none());
+
+        // 4. Responses 非流式响应：web_search_call + url_citation → server_tool_use + web_search_tool_result
+        let up_resp = json!({
+            "id": "resp_ws_1",
+            "status": "completed",
+            "model": "gpt-6-luna",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "rust docs",
+                        "sources": [{"type": "url", "url": "https://doc.rust-lang.org/"}]
+                    }
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "See Rust docs.",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://doc.rust-lang.org/",
+                            "title": "Rust Documentation"
+                        }]
+                    }]
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 20}
+        });
+        let anth = openai_responses_to_anthropic_with_web_search(&up_resp, Some("web_search")).unwrap();
+        assert_eq!(anth["content"][0]["type"], "server_tool_use");
+        assert_eq!(anth["content"][0]["id"], "ws_1");
+        assert_eq!(anth["content"][0]["input"]["query"], "rust docs");
+        assert_eq!(anth["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(anth["content"][1]["content"][0]["title"], "Rust Documentation");
+        assert_eq!(anth["content"][2], json!({"type": "text", "text": "See Rust docs."}));
+        assert_eq!(anth["usage"]["server_tool_use"]["web_search_requests"], 1);
+
+        // 5. Responses 流式 SSE
+        let sse = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ws_2\",\"model\":\"gpt-6-luna\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_2\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\",\"sources\":[{\"url\":\"https://rust-lang.org/\",\"title\":\"Rust\"}]}}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Found it.\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n"
+        );
+        let mut conv = ResponsesSseConverter::with_web_search_name(Some("web_search".into()));
+        let mut raw = String::new();
+        for ev in conv.push_bytes(sse.as_bytes()) {
+            raw.push_str(&ev);
+        }
+        for ev in conv.finish() {
+            raw.push_str(&ev);
+        }
+        let events = parse_sse(&raw);
+        let start_types: Vec<&str> = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_start")
+            .filter_map(|(_, v)| v.pointer("/content_block/type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(start_types, vec!["server_tool_use", "web_search_tool_result", "text"]);
+        let delta_ev = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(delta_ev.1["usage"]["server_tool_use"]["web_search_requests"], 1);
     }
 }

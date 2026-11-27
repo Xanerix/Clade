@@ -555,6 +555,7 @@ async fn forward_openai_responses(
         }
     };
     let want_stream = v.get("stream").and_then(Value::as_bool) == Some(true);
+    let web_search_name = convert::anthropic_web_search_tool_name(v).map(String::from);
 
     let mut headers = HeaderMap::new();
     for (k, val) in &parts.headers {
@@ -596,7 +597,7 @@ async fn forward_openai_responses(
 
     if is_sse {
         gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
-        let sse = convert::openai_responses_sse_to_anthropic_sse(resp.bytes_stream());
+        let sse = convert::openai_responses_sse_to_anthropic_sse_with_web_search(resp.bytes_stream(), web_search_name);
         return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -620,7 +621,7 @@ async fn forward_openai_responses(
             return api_error(StatusCode::BAD_GATEWAY, "api_error", format!("clade 网关：{} 返回的不是 JSON：{e}", route.card.id));
         }
     };
-    match convert::openai_responses_to_anthropic(&up_json) {
+    match convert::openai_responses_to_anthropic_with_web_search(&up_json, web_search_name.as_deref()) {
         Ok(anthropic) => {
             gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
             (status, Json(anthropic)).into_response()
@@ -651,6 +652,7 @@ async fn forward_gemini_native(
     }
 
     let want_stream = v.get("stream").and_then(Value::as_bool) == Some(true);
+    let web_search_name = convert::anthropic_web_search_tool_name(v).map(String::from);
     let url = gemini_url(&route.card.base_url, upstream_model, want_stream);
     let up_path = url_path(&url);
     let tag = format!("POST {path} proto={} upstream={up_path} model={upstream_model} card={}", route.protocol.as_str(), route.card.id);
@@ -703,7 +705,7 @@ async fn forward_gemini_native(
 
     if is_sse {
         gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
-        let sse = convert::gemini_sse_to_anthropic_sse(resp.bytes_stream());
+        let sse = convert::gemini_sse_to_anthropic_sse_with_options(resp.bytes_stream(), None, web_search_name);
         return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -727,7 +729,7 @@ async fn forward_gemini_native(
             return api_error(StatusCode::BAD_GATEWAY, "api_error", format!("clade 网关：{} 返回的不是 JSON：{e}", route.card.id));
         }
     };
-    match convert::gemini_to_anthropic(&up_json) {
+    match convert::gemini_to_anthropic_with_web_search(&up_json, web_search_name.as_deref()) {
         Ok(anthropic) => {
             gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
             (status, Json(anthropic)).into_response()
@@ -774,6 +776,7 @@ async fn forward_openai_oauth(
     };
     let body_bytes = serde_json::to_vec(&resp_req).unwrap();
     let want_stream = v.get("stream").and_then(Value::as_bool) == Some(true);
+    let web_search_name = convert::anthropic_web_search_tool_name(v).map(String::from);
 
     let (mut access_token, mut account_id, can_refresh) = {
         let mut guard = creds_lock.lock().await;
@@ -874,7 +877,7 @@ async fn forward_openai_oauth(
 
     if is_sse && want_stream {
         gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
-        let sse = convert::openai_responses_sse_to_anthropic_sse(resp.bytes_stream());
+        let sse = convert::openai_responses_sse_to_anthropic_sse_with_web_search(resp.bytes_stream(), web_search_name);
         return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -892,7 +895,7 @@ async fn forward_openai_oauth(
     };
 
     if is_sse {
-        return match convert::collect_responses_sse_to_anthropic(&bytes) {
+        return match convert::collect_responses_sse_to_anthropic_with_web_search(&bytes, web_search_name.as_deref()) {
             Ok(anthropic) => {
                 gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
                 (status, Json(anthropic)).into_response()
@@ -912,7 +915,7 @@ async fn forward_openai_oauth(
             return api_error(StatusCode::BAD_GATEWAY, "api_error", format!("clade 网关：{} 返回的不是 JSON：{e}", route.card.id));
         }
     };
-    match convert::openai_responses_to_anthropic(&up_json) {
+    match convert::openai_responses_to_anthropic_with_web_search(&up_json, web_search_name.as_deref()) {
         Ok(anthropic) => {
             gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
             (status, Json(anthropic)).into_response()
@@ -955,6 +958,7 @@ async fn forward_antigravity(
 
     let want_stream = v.get("stream").and_then(Value::as_bool) == Some(true);
     let thinking_disabled = v.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled");
+    let web_search_name = convert::anthropic_web_search_tool_name(v).map(String::from);
     let base = if route.card.base_url.trim().is_empty() {
         antigravity::API_BASE_URL
     } else {
@@ -1069,8 +1073,9 @@ async fn forward_antigravity(
         tokio::select! {
             res = &mut send_fut => res,
             _ = tokio::time::sleep(ANTIGRAVITY_EARLY_THINKING_DELAY) => {
+                let ws_name_early = web_search_name.clone();
                 let sse = async_stream::stream! {
-                    let mut conv = convert::GeminiSseConverter::new();
+                    let mut conv = convert::GeminiSseConverter::with_web_search_name(ws_name_early);
                     for ev in conv.start_early_thinking(&effective_model) {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(ev));
                     }
@@ -1168,7 +1173,11 @@ async fn forward_antigravity(
 
     if is_sse && want_stream {
         gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
-        let sse = convert::gemini_sse_to_anthropic_sse_with_keepalive(resp.bytes_stream(), Some(ANTIGRAVITY_SSE_KEEPALIVE));
+        let sse = convert::gemini_sse_to_anthropic_sse_with_options(
+            resp.bytes_stream(),
+            Some(ANTIGRAVITY_SSE_KEEPALIVE),
+            web_search_name,
+        );
         return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -1185,7 +1194,7 @@ async fn forward_antigravity(
         }
     };
     if is_sse {
-        return match convert::collect_gemini_sse_to_anthropic(&bytes) {
+        return match convert::collect_gemini_sse_to_anthropic_with_web_search(&bytes, web_search_name.as_deref()) {
             Ok(anthropic) => {
                 gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
                 (status, Json(anthropic)).into_response()
@@ -1204,7 +1213,7 @@ async fn forward_antigravity(
             return api_error(StatusCode::BAD_GATEWAY, "api_error", format!("clade 网关：{card_id} 返回的不是 JSON：{e}"));
         }
     };
-    match convert::gemini_to_anthropic(&up_json) {
+    match convert::gemini_to_anthropic_with_web_search(&up_json, web_search_name.as_deref()) {
         Ok(anthropic) => {
             gw.log(&format!("{tag} {} {ms}ms", status.as_u16()));
             (status, Json(anthropic)).into_response()

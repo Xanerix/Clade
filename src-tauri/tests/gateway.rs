@@ -59,6 +59,13 @@ fn fake_upstream(seen: Seen) -> u16 {
                                 )
                                     .into_response();
                             }
+                            if model == "ws-search" {
+                                let sse = concat!(
+                                    "data: {\"response\":{\"responseId\":\"ca-ws\",\"modelVersion\":\"ws-search\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"最新 Rust 为 1.100.0\"}]}}]}}\n\n",
+                                    "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"STOP\",\"groundingMetadata\":{\"webSearchQueries\":[\"rust latest\"],\"groundingChunks\":[{\"web\":{\"title\":\"rust-lang.org\",\"uri\":\"https://example.com/rust\"}}]}}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":6}}}\n\n"
+                                );
+                                return ([("content-type", "text/event-stream")], sse).into_response();
+                            }
                             if stream {
                                 let sse = "data: {\"response\":{\"responseId\":\"ca-s1\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"来自CodeAssist\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":4}}}\n\n";
                                 return ([("content-type", "text/event-stream")], sse).into_response();
@@ -147,6 +154,15 @@ fn fake_upstream(seen: Seen) -> u16 {
                                     r#"{"error":{"message":"invalid input","type":"invalid_request_error"}}"#,
                                 )
                                     .into_response();
+                            }
+                            if model == "ws-resp" {
+                                let sse = concat!(
+                                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ws\",\"model\":\"ws-resp\"}}\n\n",
+                                    "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_call_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust release\",\"sources\":[{\"url\":\"https://rust-lang.org/\",\"title\":\"Rust\"}]}}}\n\n",
+                                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Rust 1.100.0\"}\n\n",
+                                    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n"
+                                );
+                                return ([("content-type", "text/event-stream")], sse).into_response();
                             }
                             if stream {
                                 let sse = concat!(
@@ -1320,6 +1336,126 @@ fn system_prompt_and_reminder_policies() {
         let (_, _, body) = s.last().unwrap();
         assert!(body["system"][0]["text"].as_str().unwrap().contains("<cc_automode_permissions>"));
     }
+}
+
+#[test]
+fn web_search_e2e_antigravity_and_codex_oauth() {
+    unsafe { std::env::set_var("NO_PROXY", "127.0.0.1") };
+    let seen: Seen = Default::default();
+    let up = fake_upstream(seen.clone());
+
+    let agy_card = Card {
+        id: "agy-ws".into(),
+        name: "AgyWS".into(),
+        kind: CardKind::Antigravity,
+        protocol: ApiFormat::Anthropic,
+        base_url: format!("http://127.0.0.1:{up}/codeassist"),
+        auth: Auth::Bearer,
+        model_list: vec![CardModel { id: "ws-search".into(), context: 1_000_000 }],
+        ..Default::default()
+    };
+    let agy_creds = AntigravityCreds {
+        access_token: "ya29.ws".into(),
+        refresh_token: String::new(),
+        email: "u@example.com".into(),
+        project_id: "proj-ws".into(),
+        plan: "PRO".into(),
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        updated_at_ms: 0,
+    };
+
+    let oa_card = Card {
+        id: "oa-ws".into(),
+        name: "OaWS".into(),
+        kind: CardKind::OpenAiOAuth,
+        protocol: ApiFormat::Anthropic,
+        base_url: format!("http://127.0.0.1:{up}/openai-resp/v1/responses"),
+        auth: Auth::Bearer,
+        model_list: vec![CardModel { id: "ws-resp".into(), context: 200_000 }],
+        ..Default::default()
+    };
+    let oa_creds = OpenAiOAuthCreds {
+        access_token: "at-ws".into(),
+        refresh_token: String::new(),
+        chatgpt_account_id: "acct-ws".into(),
+        email: "u@example.com".into(),
+        plan_type: "plus".into(),
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        updated_at_ms: 0,
+    };
+
+    let port = gateway::start(Config {
+        routes: vec![
+            Route {
+                card: agy_card,
+                auth: RouteAuth::Antigravity(Arc::new(tokio::sync::Mutex::new(agy_creds))),
+                protocol: ApiFormat::Anthropic,
+            },
+            Route {
+                card: oa_card,
+                auth: RouteAuth::OpenAiOAuth(Arc::new(tokio::sync::Mutex::new(oa_creds))),
+                protocol: ApiFormat::Anthropic,
+            },
+        ],
+        token: "tok-ws".into(),
+        log: None,
+        proxy: Proxy::Env,
+        classifier_prompt: None,
+    })
+    .unwrap();
+
+    let http = reqwest::blocking::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+
+    // 1. Antigravity 流式 WebSearch：发 googleSearch，收回 server_tool_use + web_search_tool_result
+    let r = http
+        .post(format!("{base}/v1/messages"))
+        .bearer_auth("tok-ws")
+        .json(&json!({
+            "model": "cl-claude-agy-ws--ws-search[1m]",
+            "max_tokens": 128,
+            "stream": true,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "tool_choice": {"type": "tool", "name": "web_search"},
+            "messages": [{"role": "user", "content": "latest rust"}]
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let sse = r.text().unwrap();
+    assert!(sse.contains("\"type\":\"server_tool_use\""), "{sse}");
+    assert!(sse.contains("\"type\":\"web_search_tool_result\""), "{sse}");
+    assert!(sse.contains("https://example.com/rust"), "{sse}");
+    assert!(sse.contains("最新 Rust 为 1.100.0"), "{sse}");
+    assert!(sse.contains("\"web_search_requests\":1"), "{sse}");
+
+    // 2. OpenAI Codex OAuth 流式 WebSearch：发 web_search + external_web_access + include，收回结果块
+    let r = http
+        .post(format!("{base}/v1/messages"))
+        .bearer_auth("tok-ws")
+        .json(&json!({
+            "model": "cl-claude-oa-ws--ws-resp",
+            "max_tokens": 128,
+            "stream": true,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "tool_choice": {"type": "tool", "name": "web_search"},
+            "messages": [{"role": "user", "content": "latest rust"}]
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let sse = r.text().unwrap();
+    assert!(sse.contains("\"type\":\"server_tool_use\""), "{sse}");
+    assert!(sse.contains("\"type\":\"web_search_tool_result\""), "{sse}");
+    assert!(sse.contains("https://rust-lang.org/"), "{sse}");
+    assert!(sse.contains("Rust 1.100.0"), "{sse}");
+
+    let calls = seen.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].2["request"]["tools"], json!([{ "googleSearch": {} }]));
+    assert_eq!(calls[1].2["tools"][0]["type"], "web_search");
+    assert_eq!(calls[1].2["tools"][0]["external_web_access"], true);
+    assert_eq!(calls[1].2["tool_choice"], "required");
 }
 
 /// 实机联调：使用 ~/.clade 里已登录的 OpenAI 登录卡测试状态、拉取模型、查额度、流式/非流式/工具调用转发。
