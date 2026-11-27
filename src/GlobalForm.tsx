@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, motion } from "motion/react";
-import { TRANSITION_INDICATOR, VIEW_VARIANTS } from "./motion";
+import {
+  createDirectionalVariants,
+  TRANSITION_INDICATOR,
+  type SlideMotion,
+} from "./motion";
 import { ASSET_LABEL, SHARED_INFO, SHARED_KEYS, type AssetKind, type Global, type State } from "./types";
 import {
   buildSettingSearchItems,
@@ -27,11 +31,15 @@ import { PromptPolicyControl, SettingRow, SwitchGroups, ToggleSwitch, TriState }
 type Props = {
   state: State;
   focusTarget?: SettingsTarget | null;
+  skipEnter?: boolean;
+  getViewMotion: () => SlideMotion;
   onSaved: (text: string) => Promise<void>;
   onToast: (text: string, bad?: boolean) => void;
   onRefresh: () => Promise<State>;
   onDirtyChange: (dirty: boolean) => void;
 };
+
+const SETTINGS_SEC_ORDER: SettingsSec[] = SETTINGS_GROUPS.flatMap((g) => g.items.map((it) => it.id));
 
 const ICONS: Record<SettingsSec | "search", React.ReactNode> = {
   general: <SlidersIcon />,
@@ -44,10 +52,26 @@ const ICONS: Record<SettingsSec | "search", React.ReactNode> = {
   search: <SearchIcon />,
 };
 
-export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRefresh, onDirtyChange }: Props) {
+export default function GlobalForm({ state, focusTarget, skipEnter = false, getViewMotion, onSaved, onToast, onRefresh, onDirtyChange }: Props) {
   const initialJson = useMemo(() => JSON.stringify(state.global), [state.global]);
   const [form, setForm] = useState<Global>(structuredClone(state.global));
   const [sec, setSec] = useState<SettingsSec>(focusTarget?.sec ?? "general");
+  const [hasSwitchedInner, setHasSwitchedInner] = useState(false);
+  const innerMotionRef = useRef<SlideMotion | null>(null);
+  const viewMotion = useMemo(() => createDirectionalVariants(getViewMotion), [getViewMotion]);
+  const innerMotion = useMemo(
+    () => createDirectionalVariants(() => innerMotionRef.current ?? getViewMotion()),
+    [getViewMotion],
+  );
+  const switchSec = (nextSec: SettingsSec) => {
+    if (nextSec === sec) return;
+    innerMotionRef.current = {
+      axis: "y",
+      dir: SETTINGS_SEC_ORDER.indexOf(nextSec) > SETTINGS_SEC_ORDER.indexOf(sec) ? 1 : -1,
+    };
+    setHasSwitchedInner(true);
+    setSec(nextSec);
+  };
   const [search, setSearch] = useState("");
   const [pendingFocus, setPendingFocus] = useState<{ itemId: string; seq: number } | null>(
     focusTarget?.itemId ? { itemId: focusTarget.itemId, seq: focusTarget.seq } : null,
@@ -66,6 +90,13 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
 
   useEffect(() => {
     if (!focusTarget) return;
+    if (focusTarget.sec !== sec) {
+      innerMotionRef.current = {
+        axis: "y",
+        dir: SETTINGS_SEC_ORDER.indexOf(focusTarget.sec) > SETTINGS_SEC_ORDER.indexOf(sec) ? 1 : -1,
+      };
+      setHasSwitchedInner(true);
+    }
     setSec(focusTarget.sec);
     if (focusTarget.itemId) {
       setPendingFocus({ itemId: focusTarget.itemId, seq: focusTarget.seq });
@@ -83,7 +114,7 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
       const root = mainRef.current;
       const target = root?.querySelector<HTMLElement>(`[data-setting-id="${CSS.escape(itemId)}"]`) ?? null;
       if (!target) {
-        if (++tries < 20) raf = window.requestAnimationFrame(locate);
+        if (++tries < 60) raf = window.requestAnimationFrame(locate);
         return;
       }
       target.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -126,7 +157,7 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
   const cur = allItems.find((x) => x.id === sec) ?? allItems[0];
 
   const jumpToSetting = (targetSec: SettingsSec, itemId: string) => {
-    setSec(targetSec);
+    switchSec(targetSec);
     setPendingFocus({ itemId, seq: ++highlightSeq.current });
   };
 
@@ -155,7 +186,12 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
 
   return (
     <div className="settings-shell">
-      <nav className="settings-nav">
+      <motion.nav
+        className="settings-nav"
+        variants={viewMotion.indexed}
+        custom={{ forward: 0, backward: 2 }}
+        initial={skipEnter ? false : undefined}
+      >
         <div className="s-search">
           {ICONS.search}
           <input
@@ -201,7 +237,7 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                   key={it.id}
                   type="button"
                   className={`s-nav-item ${sec === it.id ? "on" : ""}`}
-                  onClick={() => setSec(it.id)}
+                  onClick={() => switchSec(it.id)}
                 >
                   {sec === it.id && (
                     <motion.span className="s-nav-pill" layoutId="settings-nav-pill" transition={TRANSITION_INDICATOR} />
@@ -215,7 +251,7 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
             </div>
           ))
         )}
-      </nav>
+      </motion.nav>
 
       <form
         ref={mainRef}
@@ -227,7 +263,12 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
         }}
       >
         <div className="settings-content">
-          <div className="settings-head">
+          <motion.div
+            className="settings-head"
+            variants={viewMotion.indexed}
+            custom={{ forward: 1, backward: 0 }}
+            initial={skipEnter ? false : undefined}
+          >
             <h1 className="settings-h1">
               <span>{cur.label}</span>
               {dirty && <span className="dirty-mark" title="有未保存改动" />}
@@ -237,19 +278,21 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                 保存
               </button>
             )}
-          </div>
+          </motion.div>
 
-          <AnimatePresence mode="wait" initial={false}>
-            <motion.div
-              key={sec}
-              className="settings-sec-body"
-              variants={VIEW_VARIANTS}
-              initial="initial"
-              animate="animate"
-              exit="exit"
-            >
+          <motion.div variants={viewMotion.block} custom={{ forward: 2, backward: 1 }}>
+            <AnimatePresence mode="wait" initial={!skipEnter}>
+              <motion.div
+                key={sec}
+                className="settings-sec-body"
+                variants={innerMotion.subPage}
+                custom={hasSwitchedInner ? "inner" : "view-enter"}
+                initial="hidden"
+                animate="show"
+                exit="exit"
+              >
           {sec === "general" && (
-            <div className="settings-group-block">
+            <motion.div className="settings-group-block" variants={innerMotion.card}>
               <h3 className="settings-group-h">指令</h3>
               <div className="set-card">
                 <SettingRow
@@ -265,11 +308,11 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                   }
                 />
               </div>
-            </div>
+            </motion.div>
           )}
 
           {sec === "proxy" && (
-            <div className="settings-group-block">
+            <motion.div className="settings-group-block" variants={innerMotion.card}>
               <h3 className="settings-group-h">代理策略</h3>
               <div className="set-card">
                 <SettingRow
@@ -286,14 +329,14 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                   control={<span className="set-code">{state.systemProxy ?? "注册表未配置"}</span>}
                 />
               </div>
-            </div>
+            </motion.div>
           )}
 
           {sec === "assets" &&
             (["skills", "plugins", "mcp"] as AssetKind[]).map((k) => {
               const items = [...new Set([...state.library[k], ...form.assets[k]])].sort();
               return (
-                <div key={k} className="settings-group-block">
+                <motion.div key={k} className="settings-group-block" variants={innerMotion.card}>
                   <h3 className="settings-group-h">{ASSET_LABEL[k]}</h3>
                   <div className="set-card" data-setting-id={`assets:${k}`}>
                     <div className="set-pad">
@@ -323,12 +366,12 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                       )}
                     </div>
                   </div>
-                </div>
+                </motion.div>
               );
             })}
 
           {sec === "shared" && (
-            <div className="settings-group-block">
+            <motion.div className="settings-group-block" variants={innerMotion.card}>
               <h3 className="settings-group-h">
                 <span className="inline-title">
                   <span>Junction</span>
@@ -357,12 +400,12 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                   );
                 })}
               </div>
-            </div>
+            </motion.div>
           )}
 
           {sec === "prompts" && (
             <>
-              <div className="settings-group-block">
+              <motion.div className="settings-group-block" variants={innerMotion.card}>
                 <h3 className="settings-group-h">聚合模式默认改写</h3>
                 <div className="set-card">
                   <PromptPolicyControl
@@ -394,9 +437,9 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                     placeholder="填写替换后的 reminder 内容（会自动包裹 <system-reminder> 并置于首条用户消息前）"
                   />
                 </div>
-              </div>
+              </motion.div>
 
-              <div className="settings-group-block">
+              <motion.div className="settings-group-block" variants={innerMotion.card}>
                 <div className="settings-group-h">
                   <span>auto 分类器默认提示词</span>
                   <div style={{ display: "flex", gap: 6 }}>
@@ -433,7 +476,7 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                     </span>
                   </div>
                 </div>
-              </div>
+              </motion.div>
             </>
           )}
 
@@ -442,11 +485,12 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
               defs={state.switches.global}
               value={form.switches}
               onChange={(v) => setForm({ ...form, switches: v })}
+              cardVariants={innerMotion.card}
             />
           )}
 
           {sec === "tools" && (
-            <div className="settings-group-block">
+            <motion.div className="settings-group-block" variants={innerMotion.card}>
               <h3 className="settings-group-h">目录与集成</h3>
               <div className="set-card">
                 <SettingRow
@@ -531,10 +575,11 @@ export default function GlobalForm({ state, focusTarget, onSaved, onToast, onRef
                   }
                 />
               </div>
-            </div>
-          )}
             </motion.div>
-          </AnimatePresence>
+          )}
+              </motion.div>
+            </AnimatePresence>
+          </motion.div>
         </div>
       </form>
     </div>

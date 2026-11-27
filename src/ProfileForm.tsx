@@ -2,7 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { AnimatePresence, motion } from "motion/react";
-import { TRANSITION_INDICATOR, VIEW_VARIANTS } from "./motion";
+import {
+  createDirectionalVariants,
+  TRANSITION_INDICATOR,
+  type SlideMotion,
+} from "./motion";
 import {
   API_FORMAT_LABEL,
   ASSET_LABEL,
@@ -47,6 +51,8 @@ type Props = {
   state: State;
   profile: Profile | null; // null = 新建
   usageCache: Record<string, Usage>;
+  skipEnter?: boolean;
+  getViewMotion: () => SlideMotion;
   onUsageUpdated: (cardId: string, u: Usage) => void;
   onSelect: (name: string | null) => void;
   onSaved: (name: string | null, text: string) => Promise<void>;
@@ -56,6 +62,7 @@ type Props = {
 };
 
 type ProfileTab = "route" | "caps" | "policy" | "switches";
+const PROFILE_TAB_INDEX: Record<ProfileTab, number> = { route: 0, caps: 1, policy: 2, switches: 3 };
 
 const SLOT_LABEL: Record<SlotKey, string> = {
   main: "主模型",
@@ -72,6 +79,8 @@ export default function ProfileForm({
   state,
   profile,
   usageCache,
+  skipEnter = false,
+  getViewMotion,
   onUsageUpdated,
   onSelect,
   onSaved,
@@ -84,17 +93,39 @@ export default function ProfileForm({
   const [initialJson, setInitialJson] = useState(() => JSON.stringify(profile ?? blankProfile()));
   const [form, setForm] = useState<Profile>(profile ? structuredClone(profile) : blankProfile());
   const [tab, setTab] = useState<ProfileTab>("route");
+  const [hasSwitchedInner, setHasSwitchedInner] = useState(false);
   const [cloneName, setCloneName] = useState<string | null>(null);
   const [usageRefreshTick, setUsageRefreshTick] = useState(0);
   const [prevProfileKey, setPrevProfileKey] = useState(profileKey);
   const nameInputRef = useRef<HTMLInputElement>(null);
+  const innerMotionRef = useRef<SlideMotion | null>(null);
+  const viewMotion = useMemo(() => createDirectionalVariants(getViewMotion), [getViewMotion]);
+  const innerMotion = useMemo(
+    () =>
+      createDirectionalVariants(() => innerMotionRef.current ?? getViewMotion(), {
+        enterOffsetX: 28,
+        exitOffsetX: 20,
+      }),
+    [getViewMotion],
+  );
+
+  const profileOrderIndex = (key: string) => {
+    if (key === "__new__") return state.profiles.length;
+    const idx = state.profiles.findIndex((x) => x.name === key);
+    return idx === -1 ? state.profiles.length : idx;
+  };
 
   if (prevProfileKey !== profileKey) {
+    innerMotionRef.current = {
+      axis: "y",
+      dir: profileOrderIndex(profileKey) >= profileOrderIndex(prevProfileKey) ? 1 : -1,
+    };
     setPrevProfileKey(profileKey);
     const next = profile ? structuredClone(profile) : blankProfile();
     setForm(next);
     setInitialJson(JSON.stringify(next));
     setTab("route");
+    setHasSwitchedInner(true);
     setCloneName(null);
     setUsageRefreshTick(0);
   }
@@ -258,7 +289,7 @@ export default function ProfileForm({
       set("assets", { ...form.assets, [k]: next });
     };
     return (
-      <section key={k} className="ed-sec">
+      <motion.section key={k} className="ed-sec" variants={innerMotion.card}>
         <h2 className="ed-sec-h">{ASSET_LABEL[k]}</h2>
         <div className="set-card">
           <div className="set-pad">
@@ -290,7 +321,7 @@ export default function ProfileForm({
             )}
           </div>
         </div>
-      </section>
+      </motion.section>
     );
   };
 
@@ -316,7 +347,12 @@ export default function ProfileForm({
 
   return (
     <div className="studio">
-      <aside className="toc">
+      <motion.aside
+        className="toc"
+        variants={viewMotion.indexed}
+        custom={{ forward: 0, backward: 2 }}
+        initial={skipEnter ? false : undefined}
+      >
         {state.profiles.map((x) => {
           const active = !isNew && x.name === form.name;
           const sub = x.mode === "aggregate" ? `${x.cards.length} 张卡` : x.card || "~/.claude";
@@ -344,7 +380,7 @@ export default function ProfileForm({
             </span>
           </span>
         </button>
-      </aside>
+      </motion.aside>
 
       <form
         className="canvas-pane"
@@ -354,7 +390,12 @@ export default function ProfileForm({
           save();
         }}
       >
-        <div className="canvas-head">
+        <motion.div
+          className="canvas-head"
+          variants={viewMotion.indexed}
+          custom={{ forward: 1, backward: 0 }}
+          initial={skipEnter ? false : undefined}
+        >
           <div className="ch-top">
             {isNew ? (
               <div className="ch-title-edit">
@@ -419,7 +460,21 @@ export default function ProfileForm({
                 ["switches", "开关"],
               ] as [ProfileTab, string][]
             ).map(([id, lbl]) => (
-              <button key={id} type="button" className={`cat-tab ${tab === id ? "on" : ""}`} onClick={() => setTab(id)}>
+              <button
+                key={id}
+                type="button"
+                className={`cat-tab ${tab === id ? "on" : ""}`}
+                onClick={() => {
+                  if (id !== tab) {
+                    innerMotionRef.current = {
+                      axis: "x",
+                      dir: PROFILE_TAB_INDEX[id] > PROFILE_TAB_INDEX[tab] ? 1 : -1,
+                    };
+                    setHasSwitchedInner(true);
+                    setTab(id);
+                  }
+                }}
+              >
                 {tab === id && (
                   <motion.span className="tab-pill" layoutId="profile-cat-tab" transition={TRANSITION_INDICATOR} />
                 )}
@@ -427,10 +482,10 @@ export default function ProfileForm({
               </button>
             ))}
           </div>
-        </div>
+        </motion.div>
 
         <div className="canvas-scroll">
-          <div className="canvas-stack">
+          <motion.div className="canvas-stack" variants={viewMotion.block} custom={{ forward: 2, backward: 1 }}>
             <CollapseBox open={cloneName !== null && !isNew}>
               {cloneName !== null && !isNew && (
                 <div className="clone-bar">
@@ -450,18 +505,19 @@ export default function ProfileForm({
               )}
             </CollapseBox>
 
-            <AnimatePresence mode="wait" initial={false}>
+            <AnimatePresence mode="wait" initial={!skipEnter}>
               <motion.div
                 key={`${profileKey}:${tab}`}
                 className="canvas-tab-body"
-                variants={VIEW_VARIANTS}
-                initial="initial"
-                animate="animate"
+                variants={innerMotion.subPage}
+                custom={hasSwitchedInner ? "inner" : "view-enter"}
+                initial="hidden"
+                animate="show"
                 exit="exit"
               >
             {tab === "route" && (
               <>
-                <section className="ed-sec">
+                <motion.section className="ed-sec" variants={innerMotion.card}>
                   <h2 className="ed-sec-h">连接拓扑</h2>
                   <div className="topo-stack">
                     <div className="mode-row">
@@ -549,10 +605,10 @@ export default function ProfileForm({
                   {direct && directCard && (directCard.kind === "openai_oauth" || directCard.kind === "antigravity" || (directCard.kind === "api" && directCard.protocol !== "anthropic")) && (
                     <span className="set-sub bad">该卡仅支持聚合模式，请切换到聚合网关或更换模型卡。</span>
                   )}
-                </section>
+                </motion.section>
 
                 {thirdParty && (
-                  <section className="ed-sec">
+                  <motion.section className="ed-sec" variants={innerMotion.card}>
                     <h2 className="ed-sec-h">模型位</h2>
                     <div className="slot-bento">
                       {SLOT_KEYS.map((k) => (
@@ -568,11 +624,11 @@ export default function ProfileForm({
                         {pickSelect(form.classifierModel, "跟随 Sonnet", (p) => set("classifierModel", p))}
                       </div>
                     </div>
-                  </section>
+                  </motion.section>
                 )}
 
                 {usageCard !== null && (
-                  <section className="ed-sec">
+                  <motion.section className="ed-sec" variants={innerMotion.card}>
                     <div className="ed-sec-h">
                       <span>订阅额度（{usageCard ? `官方卡 ${usageCard}` : "~/.claude"}）</span>
                       <button
@@ -595,11 +651,11 @@ export default function ProfileForm({
                         />
                       </div>
                     </div>
-                  </section>
+                  </motion.section>
                 )}
 
                 {!direct && (
-                  <section className="ed-sec">
+                  <motion.section className="ed-sec" variants={innerMotion.card}>
                     <h2 className="ed-sec-h">网关策略</h2>
                     <div className="set-card">
                       <PromptPolicyControl
@@ -681,7 +737,7 @@ export default function ProfileForm({
                         </CollapseBox>
                       </SettingRow>
                     </div>
-                  </section>
+                  </motion.section>
                 )}
               </>
             )}
@@ -690,7 +746,7 @@ export default function ProfileForm({
               <>
                 {(["skills", "plugins", "mcp"] as AssetKind[]).map(renderAssetSection)}
 
-                <section className="ed-sec">
+                <motion.section className="ed-sec" variants={innerMotion.card}>
                   <h2 className="ed-sec-h">
                     <span className="inline-title">
                       <span>共享目录</span>
@@ -699,13 +755,13 @@ export default function ProfileForm({
                     </span>
                   </h2>
                   <div className="set-card">{SHARED_KEYS.map(renderSharedRow)}</div>
-                </section>
+                </motion.section>
               </>
             )}
 
             {tab === "policy" && (
               <>
-                <section className="ed-sec">
+                <motion.section className="ed-sec" variants={innerMotion.card}>
                   <h2 className="ed-sec-h">配置继承</h2>
                   <div className="set-card">
                     <SettingRow
@@ -749,9 +805,9 @@ export default function ProfileForm({
                       }
                     />
                   </div>
-                </section>
+                </motion.section>
 
-                <section className="ed-sec">
+                <motion.section className="ed-sec" variants={innerMotion.card}>
                   <h2 className="ed-sec-h">权限与署名</h2>
                   <div className="set-card">
                     <SettingRow
@@ -794,9 +850,9 @@ export default function ProfileForm({
                       }
                     />
                   </div>
-                </section>
+                </motion.section>
 
-                <section className="ed-sec">
+                <motion.section className="ed-sec" variants={innerMotion.card}>
                   <h2 className="ed-sec-h">排除的 CLAUDE.md</h2>
                   <div className="set-card">
                     {form.claudeMdExcludes.length === 0 ? (
@@ -820,14 +876,14 @@ export default function ProfileForm({
                       ))
                     )}
                   </div>
-                </section>
+                </motion.section>
               </>
             )}
 
             {tab === "switches" && (
               <>
                 {thirdParty && (
-                  <section className="ed-sec">
+                  <motion.section className="ed-sec" variants={innerMotion.card}>
                     <h2 className="ed-sec-h">兼容</h2>
                     <div className="set-card">
                       {state.switches.compat.map((d) => {
@@ -849,19 +905,20 @@ export default function ProfileForm({
                         );
                       })}
                     </div>
-                  </section>
+                  </motion.section>
                 )}
 
                 <SwitchGroups
                   defs={state.switches.profile}
                   value={form.switches}
                   onChange={(v) => set("switches", v)}
+                  cardVariants={innerMotion.card}
                 />
               </>
             )}
               </motion.div>
             </AnimatePresence>
-          </div>
+          </motion.div>
         </div>
       </form>
     </div>

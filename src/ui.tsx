@@ -1,8 +1,9 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, type Variants } from "motion/react";
 import {
+  CARD_VARIANTS,
   COLLAPSE_VARIANTS,
   EASE_EDITORIAL,
   MODAL_VARIANTS,
@@ -430,10 +431,12 @@ export function SwitchGroups({
   defs,
   value,
   onChange,
+  cardVariants = CARD_VARIANTS,
 }: {
   defs: SwitchDef[];
   value: Switches;
   onChange: (v: Switches) => void;
+  cardVariants?: Variants;
 }) {
   const groups = [...new Set(defs.map((d) => d.group))];
   const set = (key: string, v: Switch | null) => {
@@ -448,7 +451,7 @@ export function SwitchGroups({
       {groups.map((g) => {
         const items = defs.filter((d) => d.group === g);
         return (
-          <div key={g} className="settings-group-block">
+          <motion.div key={g} className="settings-group-block" variants={cardVariants}>
             <h3 className="settings-group-h">{g}</h3>
             <div className="set-card">
               {items.map((d) => (
@@ -462,7 +465,7 @@ export function SwitchGroups({
                 />
               ))}
             </div>
-          </div>
+          </motion.div>
         );
       })}
     </>

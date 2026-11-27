@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { AnimatePresence, motion } from "motion/react";
-import { TRANSITION_INDICATOR, VIEW_VARIANTS } from "./motion";
+import { createDirectionalVariants, TRANSITION_INDICATOR, type SlideMotion } from "./motion";
 import {
   API_FORMAT_LABEL,
   blankCard,
@@ -33,6 +33,7 @@ type Props = {
 };
 
 type ModalTab = "base" | "models";
+const MODAL_TAB_INDEX: Record<ModalTab, number> = { base: 0, models: 1 };
 
 export default function CardForm({
   state,
@@ -48,6 +49,28 @@ export default function CardForm({
   const initialJson = useMemo(() => JSON.stringify(card ?? blankCard()), [card]);
   const [form, setForm] = useState<Card>(card ? structuredClone(card) : blankCard());
   const [tab, setTab] = useState<ModalTab>("base");
+  const tabMotionRef = useRef<SlideMotion>({ axis: "x", dir: 1 });
+  const tabMotion = useMemo(
+    () =>
+      createDirectionalVariants(() => tabMotionRef.current, {
+        enterOffsetX: 20,
+        exitOffsetX: 14,
+        enterDuration: 0.26,
+        exitDuration: 0.15,
+        enterDelay: 0.015,
+        enterStagger: 0.035,
+        exitStagger: 0.02,
+      }),
+    [],
+  );
+  const switchTab = (next: ModalTab) => {
+    if (next === tab) return;
+    tabMotionRef.current = {
+      axis: "x",
+      dir: MODAL_TAB_INDEX[next] > MODAL_TAB_INDEX[tab] ? 1 : -1,
+    };
+    setTab(next);
+  };
   const [key, setKey] = useState("");
   const [fetched, setFetched] = useState<string[]>([]);
   const [manual, setManual] = useState("");
@@ -159,13 +182,13 @@ export default function CardForm({
 
   async function save(keyArg: string | null) {
     if (isNew && !form.id.trim()) {
-      setTab("base");
+      switchTab("base");
       window.setTimeout(() => idInputRef.current?.focus(), 0);
       fail("请填写模型卡 ID");
       return;
     }
     if (isApi && !form.baseUrl.trim()) {
-      setTab("base");
+      switchTab("base");
       window.setTimeout(() => baseUrlInputRef.current?.focus(), 0);
       fail("请填写 Base URL");
       return;
@@ -339,7 +362,7 @@ export default function CardForm({
                   key={id}
                   type="button"
                   className={`cat-tab ${activeTab === id ? "on" : ""}`}
-                  onClick={() => setTab(id)}
+                  onClick={() => switchTab(id)}
                 >
                   {activeTab === id && (
                     <motion.span className="tab-pill" layoutId="card-modal-tab" transition={TRANSITION_INDICATOR} />
@@ -356,14 +379,15 @@ export default function CardForm({
             <motion.div
               key={activeTab}
               className="mc-tab-body"
-              variants={VIEW_VARIANTS}
-              initial="initial"
-              animate="animate"
+              variants={tabMotion.subPage}
+              custom="inner"
+              initial="hidden"
+              animate="show"
               exit="exit"
             >
           {activeTab === "base" ? (
             <>
-              <div className="field-2">
+              <motion.div className="field-2" variants={tabMotion.card}>
                 {isNew ? (
                   <div className="field">
                     <label>类型</label>
@@ -395,22 +419,22 @@ export default function CardForm({
                     onChange={(e) => set("id", e.target.value.toLowerCase())}
                   />
                 </div>
-              </div>
+              </motion.div>
 
               {isNew && (
-                <div className="field">
+                <motion.div className="field" variants={tabMotion.card}>
                   <label>显示名</label>
                   <input
                     value={form.name}
                     placeholder={official ? "例如 Claude 备用" : openaiOauth ? "例如 ChatGPT 主号" : antigravity ? "例如 Antigravity 主号" : "例如 DeepSeek"}
                     onChange={(e) => set("name", e.target.value)}
                   />
-                </div>
+                </motion.div>
               )}
 
               {isApi ? (
                 <>
-                  <div className="field-2">
+                  <motion.div className="field-2" variants={tabMotion.card}>
                     <div className="field">
                       <label>协议</label>
                       <select
@@ -445,9 +469,9 @@ export default function CardForm({
                         )}
                       </select>
                     </div>
-                  </div>
+                  </motion.div>
 
-                  <div className="field">
+                  <motion.div className="field" variants={tabMotion.card}>
                     <label>Base URL</label>
                     <input
                       ref={baseUrlInputRef}
@@ -462,9 +486,9 @@ export default function CardForm({
                       }
                       onChange={(e) => set("baseUrl", e.target.value.trim())}
                     />
-                  </div>
+                  </motion.div>
 
-                  <div className="field">
+                  <motion.div className="field" variants={tabMotion.card}>
                     <div className="field-head">
                       <label htmlFor="card-api-key-input">API Key</label>
                       {hasKey && (
@@ -489,10 +513,10 @@ export default function CardForm({
                     <span className="set-sub">
                       存在 Windows 凭据管理器中。{!isAnthropic && "非 Anthropic 协议仅用于聚合模式。"}
                     </span>
-                  </div>
+                  </motion.div>
                 </>
               ) : (
-                <div className="set-card">
+                <motion.div className="set-card" variants={tabMotion.card}>
                   <div className="set-row">
                     {isNew ? (
                       <span className="set-sub">请先保存这张卡，再进行账号登录。</span>
@@ -625,18 +649,21 @@ export default function CardForm({
                       />
                     </div>
                   )}
-                </div>
+                </motion.div>
               )}
 
               {!isNew && (
-                <span className="set-sub">
+                <motion.span className="set-sub" variants={tabMotion.card}>
                   {users.length ? `正在使用的环境：${users.join("、")}` : "当前没有环境使用这张卡"}
-                </span>
+                </motion.span>
               )}
             </>
           ) : (
             <>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+              <motion.div
+                style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}
+                variants={tabMotion.card}
+              >
                 <span style={{ fontWeight: 500, color: "var(--ink)" }}>模型清单</span>
                 <button
                   type="button"
@@ -646,9 +673,9 @@ export default function CardForm({
                 >
                   {fetching ? "正在拉取…" : "从上游拉取"}
                 </button>
-              </div>
+              </motion.div>
 
-              <div className="set-card">
+              <motion.div className="set-card" variants={tabMotion.card}>
                 <div className="set-pad" style={{ paddingTop: 6, paddingBottom: 6 }}>
                   {form.modelList.length === 0 ? (
                     <div className="set-sub" style={{ padding: "10px 0" }}>
@@ -695,9 +722,9 @@ export default function CardForm({
                     ))
                   )}
                 </div>
-              </div>
+              </motion.div>
 
-              <div style={{ display: "flex", gap: 8 }}>
+              <motion.div style={{ display: "flex", gap: 8 }} variants={tabMotion.card}>
                 <input
                   className="manual-model-input"
                   value={manual}
@@ -722,10 +749,10 @@ export default function CardForm({
                 >
                   添加
                 </button>
-              </div>
+              </motion.div>
 
               {fetched.length > 0 && (
-                <div className="fetched-box">
+                <motion.div className="fetched-box" variants={tabMotion.card}>
                   {fetched.map((id) => {
                     const checked = inList(id);
                     return (
@@ -743,12 +770,12 @@ export default function CardForm({
                       </button>
                     );
                   })}
-                </div>
+                </motion.div>
               )}
 
-              <span className="set-sub">
+              <motion.span className="set-sub" variants={tabMotion.card}>
                 窗口默认 200K；聚合模式下 ≥ 1M 的模型会自动附带 <span className="mono">[1m]</span> 后缀。
-              </span>
+              </motion.span>
             </>
           )}
             </motion.div>

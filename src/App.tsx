@@ -5,13 +5,15 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { AnimatePresence, motion } from "motion/react";
 import "./App.css";
 import {
+  createDirectionalVariants,
   GREETING_VARIANTS,
   MODAL_VARIANTS,
   OVERLAY_VARIANTS,
+  STAGE_CONTAINER_VARIANTS,
   TOAST_VARIANTS,
   TRANSITION_FAST,
   TRANSITION_INDICATOR,
-  VIEW_VARIANTS,
+  type SlideMotion,
 } from "./motion";
 import {
   API_FORMAT_LABEL,
@@ -41,6 +43,7 @@ import GlobalForm from "./GlobalForm";
 import Launcher from "./Launcher";
 
 type TopView = "launch" | "profiles" | "cards" | "global";
+const TOP_VIEW_INDEX: Record<TopView, number> = { launch: 0, profiles: 1, cards: 2, global: 3 };
 type Theme = "light" | "dark";
 type ToastItem = { id: number; text: string; bad?: boolean };
 
@@ -111,6 +114,10 @@ export default function App() {
   const [settingsTarget, setSettingsTarget] = useState<SettingsTarget | null>(null);
   const settingsTargetSeq = useRef(1);
   const [rev, setRev] = useState(0);
+  const [viewMountedRev, setViewMountedRev] = useState(0);
+  const viewMotionRef = useRef<SlideMotion>({ axis: "y", dir: 1 });
+  const getViewMotion = useCallback(() => viewMotionRef.current, []);
+  const viewMotion = useMemo(() => createDirectionalVariants(getViewMotion), [getViewMotion]);
   const [eggOpen, setEggOpen] = useState(false);
   const wordmarkClicksRef = useRef<{ count: number; lastAt: number }>({ count: 0, lastAt: 0 });
 
@@ -356,7 +363,14 @@ export default function App() {
         : profileId;
     const leaving = next !== view || (next === "profiles" && nextProfileId !== profileId);
     if (leaving && !(await confirmLeave())) return;
-    setView(next);
+    if (next !== view) {
+      viewMotionRef.current = {
+        axis: "x",
+        dir: TOP_VIEW_INDEX[next] > TOP_VIEW_INDEX[view] ? 1 : -1,
+      };
+      setViewMountedRev(rev);
+      setView(next);
+    }
     if (next === "global") {
       setSettingsTarget(null);
     }
@@ -473,82 +487,89 @@ export default function App() {
         void (async () => {
           if (!(await confirmLeave())) return;
           setSettingsTarget(target);
+          viewMotionRef.current = {
+            axis: "x",
+            dir: TOP_VIEW_INDEX.global > TOP_VIEW_INDEX[view] ? 1 : -1,
+          };
+          setViewMountedRev(rev);
           setView("global");
         })();
       }
     }
   };
 
-  const renderCardTile = (c: Card) => {
+  const renderCardTile = (c: Card, index: number) => {
     const users = state.profiles.filter((p) => usesCard(p, c.id));
     const auth = authMap[c.id];
     const usage = usageMap[c.id];
     const loginCard = isLoginCardKind(c.kind);
 
     return (
-      <button key={c.id} type="button" className="book-card" onClick={() => setModalCard(c.id)}>
-        <div className="book-head">
-          <div>
-            <div className="book-title">{c.name || c.id}</div>
-            <div className="book-id">{c.id}</div>
+      <motion.div key={c.id} className="card-motion-slot" variants={viewMotion.indexed} custom={index}>
+        <button type="button" className="book-card" onClick={() => setModalCard(c.id)}>
+          <div className="book-head">
+            <div>
+              <div className="book-title">{c.name || c.id}</div>
+              <div className="book-id">{c.id}</div>
+            </div>
           </div>
-        </div>
 
-        {loginCard ? (
-          usage && usage.windows.length > 0 ? (
-            <UsageBars windows={usage.windows} max={2} />
+          {loginCard ? (
+            usage && usage.windows.length > 0 ? (
+              <UsageBars windows={usage.windows} max={2} />
+            ) : (
+              <div className="book-tags">
+                {c.modelList.length > 0 ? (
+                  c.modelList.slice(0, 4).map((m) => (
+                    <span key={m.id} className="book-tag">
+                      {m.id}
+                    </span>
+                  ))
+                ) : (
+                  <span className="set-sub" style={{ fontSize: 12 }}>
+                    {auth === undefined ? "正在查询状态…" : auth.loggedIn ? "已登录" : "尚未登录"}
+                  </span>
+                )}
+              </div>
+            )
           ) : (
             <div className="book-tags">
               {c.modelList.length > 0 ? (
-                c.modelList.slice(0, 4).map((m) => (
+                c.modelList.slice(0, 6).map((m) => (
                   <span key={m.id} className="book-tag">
                     {m.id}
                   </span>
                 ))
               ) : (
                 <span className="set-sub" style={{ fontSize: 12 }}>
-                  {auth === undefined ? "正在查询状态…" : auth.loggedIn ? "已登录" : "尚未登录"}
+                  暂无模型
                 </span>
               )}
             </div>
-          )
-        ) : (
-          <div className="book-tags">
-            {c.modelList.length > 0 ? (
-              c.modelList.slice(0, 6).map((m) => (
-                <span key={m.id} className="book-tag">
-                  {m.id}
-                </span>
-              ))
-            ) : (
-              <span className="set-sub" style={{ fontSize: 12 }}>
-                暂无模型
-              </span>
-            )}
-          </div>
-        )}
-
-        <div className="book-foot">
-          {loginCard ? (
-            <div className="acct-line">
-              <span className="acct-email">
-                {auth?.loggedIn
-                  ? auth.email || auth.orgName || (c.kind === "antigravity" ? "Google 账号" : "已登录")
-                  : c.kind === "official"
-                    ? "Claude 官方"
-                    : c.kind === "openai_oauth"
-                      ? "OpenAI 登录"
-                      : "Antigravity"}
-              </span>
-            </div>
-          ) : (
-            <span>{API_FORMAT_LABEL[c.protocol]}</span>
           )}
-          <span className="mono" style={{ flexShrink: 0 }} title={`${users.length} 个环境使用`}>
-            {users.length}
-          </span>
-        </div>
-      </button>
+
+          <div className="book-foot">
+            {loginCard ? (
+              <div className="acct-line">
+                <span className="acct-email">
+                  {auth?.loggedIn
+                    ? auth.email || auth.orgName || (c.kind === "antigravity" ? "Google 账号" : "已登录")
+                    : c.kind === "official"
+                      ? "Claude 官方"
+                      : c.kind === "openai_oauth"
+                        ? "OpenAI 登录"
+                        : "Antigravity"}
+                </span>
+              </div>
+            ) : (
+              <span>{API_FORMAT_LABEL[c.protocol]}</span>
+            )}
+            <span className="mono" style={{ flexShrink: 0 }} title={`${users.length} 个环境使用`}>
+              {users.length}
+            </span>
+          </div>
+        </button>
+      </motion.div>
     );
   };
 
@@ -646,18 +667,18 @@ export default function App() {
 
       {/* STAGE */}
       <div className="stage">
-        <AnimatePresence mode="wait" initial={false}>
+        <AnimatePresence mode="wait">
           {view === "launch" && (
             <motion.div
               key="view-launch"
               className="page-scroll"
-              variants={VIEW_VARIANTS}
-              initial="initial"
-              animate="animate"
+              variants={STAGE_CONTAINER_VARIANTS}
+              initial="hidden"
+              animate="show"
               exit="exit"
             >
               <div className="page-inner">
-                <div className="hero-bar">
+                <motion.div className="hero-bar" variants={viewMotion.indexed} custom={0}>
                   <h1
                     className="hero-h1"
                     title="点击换一句问候语"
@@ -676,10 +697,10 @@ export default function App() {
                       </motion.span>
                     </AnimatePresence>
                   </h1>
-                </div>
+                </motion.div>
 
                 {missingClaude && (
-                  <div className="env-banner">
+                  <motion.div className="env-banner" variants={viewMotion.indexed} custom={1}>
                     <div className="env-banner-body">
                       <div className="env-banner-title">未检测到 Claude Code CLI（claude）</div>
                       <div className="set-sub">
@@ -719,83 +740,95 @@ export default function App() {
                         {installingClaude === "script" ? "脚本安装中…" : "脚本安装"}
                       </button>
                     </div>
-                  </div>
+                  </motion.div>
                 )}
 
                 {state.profiles.length === 0 ? (
-                  <div className="empty-state">
+                  <motion.div
+                    className="empty-state"
+                    variants={viewMotion.indexed}
+                    custom={missingClaude ? 2 : 1}
+                  >
                     <div>还没有任何环境，先创建一个环境吧。</div>
                     <button type="button" className="btn btn-primary btn-sm" onClick={() => go("profiles", null)}>
                       <PlusIcon className="ui-icon" strokeWidth={1.6} />
                       <span>新建环境</span>
                     </button>
-                  </div>
+                  </motion.div>
                 ) : (
                   <div className="launch-grid">
-                    {state.profiles.map((p) => {
+                    {state.profiles.map((p, idx) => {
                       const nodes =
                         p.mode === "aggregate"
                           ? p.cards.map(cardById).filter((c): c is Card => !!c)
                           : [cardById(p.card)].filter((c): c is Card => !!c);
                       const dirs = (recentMap[p.name] ?? []).slice(0, 4);
+                      const cardSlot = (missingClaude ? 2 : 1) + idx;
                       return (
-                        <div key={p.name} className="launch-card">
-                          <div className="lc-top">
-                            <button type="button" className="lc-name" onClick={() => go("profiles", p.name)}>
-                              {p.name}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-primary btn-sm"
-                              onClick={() => setLaunching({ name: p.name })}
-                            >
-                              <span>启动</span>
-                              <ArrowUpRightIcon className="ui-icon icon-launch" strokeWidth={1.6} />
-                            </button>
-                          </div>
+                        <motion.div
+                          key={p.name}
+                          className="card-motion-slot"
+                          variants={viewMotion.indexed}
+                          custom={cardSlot}
+                        >
+                          <div className="launch-card">
+                            <div className="lc-top">
+                              <button type="button" className="lc-name" onClick={() => go("profiles", p.name)}>
+                                {p.name}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-sm"
+                                onClick={() => setLaunching({ name: p.name })}
+                              >
+                                <span>启动</span>
+                                <ArrowUpRightIcon className="ui-icon icon-launch" strokeWidth={1.6} />
+                              </button>
+                            </div>
 
-                          <div className="card-pills">
-                            {nodes.length > 0 ? (
-                              nodes.map((c) => (
-                                <button
-                                  key={c.id}
-                                  type="button"
-                                  className="badge-pill"
-                                  onClick={() => setModalCard(c.id)}
-                                >
-                                  {c.name || c.id}
-                                </button>
-                              ))
-                            ) : (
-                              <span className="badge-pill">~/.claude</span>
-                            )}
-                          </div>
+                            <div className="card-pills">
+                              {nodes.length > 0 ? (
+                                nodes.map((c) => (
+                                  <button
+                                    key={c.id}
+                                    type="button"
+                                    className="badge-pill"
+                                    onClick={() => setModalCard(c.id)}
+                                  >
+                                    {c.name || c.id}
+                                  </button>
+                                ))
+                              ) : (
+                                <span className="badge-pill">~/.claude</span>
+                              )}
+                            </div>
 
-                          <div className="dir-list">
-                            {dirs.length === 0 ? (
-                              <div className="dir-empty">尚无最近目录，点右上角「启动」选择</div>
-                            ) : (
-                              dirs.map((d) => (
-                                <button
-                                  key={d}
-                                  type="button"
-                                  className="dir-row"
-                                  title={d}
-                                  onClick={() => setLaunching({ name: p.name, dir: d })}
-                                >
-                                  <span className="dir-row-main">
-                                    <span className="dir-name">{baseName(d)}</span>
-                                    <span className="dir-path">{d}</span>
-                                  </span>
-                                  <span className="dir-go">
-                                    <span>打开</span>
-                                    <CornerDownLeftIcon className="ui-icon-sm" />
-                                  </span>
-                                </button>
-                              ))
-                            )}
+                            <div className="dir-list">
+                              {dirs.length === 0 ? (
+                                <div className="dir-empty">尚无最近目录，点右上角「启动」选择</div>
+                              ) : (
+                                dirs.map((d) => (
+                                  <button
+                                    key={d}
+                                    type="button"
+                                    className="dir-row"
+                                    title={d}
+                                    onClick={() => setLaunching({ name: p.name, dir: d })}
+                                  >
+                                    <span className="dir-row-main">
+                                      <span className="dir-name">{baseName(d)}</span>
+                                      <span className="dir-path">{d}</span>
+                                    </span>
+                                    <span className="dir-go">
+                                      <span>打开</span>
+                                      <CornerDownLeftIcon className="ui-icon-sm" />
+                                    </span>
+                                  </button>
+                                ))
+                              )}
+                            </div>
                           </div>
-                        </div>
+                        </motion.div>
                       );
                     })}
                   </div>
@@ -808,9 +841,9 @@ export default function App() {
             <motion.div
               key="view-profiles"
               className="stage-pane"
-              variants={VIEW_VARIANTS}
-              initial="initial"
-              animate="animate"
+              variants={STAGE_CONTAINER_VARIANTS}
+              initial="hidden"
+              animate="show"
               exit="exit"
             >
               <ProfileForm
@@ -818,6 +851,8 @@ export default function App() {
                 state={state}
                 profile={selectedProfile}
                 usageCache={usageMap}
+                skipEnter={rev !== viewMountedRev}
+                getViewMotion={getViewMotion}
                 onUsageUpdated={(id, u) => setUsageMap((m) => ({ ...m, [id]: u }))}
                 onSelect={(id) => void selectProfile(id)}
                 onSaved={async (name, text) => {
@@ -837,20 +872,26 @@ export default function App() {
             <motion.div
               key="view-cards"
               className="cards-scroll"
-              variants={VIEW_VARIANTS}
-              initial="initial"
-              animate="animate"
+              variants={STAGE_CONTAINER_VARIANTS}
+              initial="hidden"
+              animate="show"
               exit="exit"
             >
               <div className="cards-inner">
                 <div className="book-grid">
-                  {state.cards.map(renderCardTile)}
-                  <button type="button" className="book-card book-add" onClick={() => setModalCard("__new__")}>
-                    <span className="book-add-label">
-                      <PlusIcon className="book-add-icon" strokeWidth={1.35} />
-                      <span>添加模型卡</span>
-                    </span>
-                  </button>
+                  {state.cards.map((c, idx) => renderCardTile(c, idx))}
+                  <motion.div
+                    className="card-motion-slot"
+                    variants={viewMotion.indexed}
+                    custom={state.cards.length}
+                  >
+                    <button type="button" className="book-card book-add" onClick={() => setModalCard("__new__")}>
+                      <span className="book-add-label">
+                        <PlusIcon className="book-add-icon" strokeWidth={1.35} />
+                        <span>添加模型卡</span>
+                      </span>
+                    </button>
+                  </motion.div>
                 </div>
               </div>
             </motion.div>
@@ -860,15 +901,17 @@ export default function App() {
             <motion.div
               key="view-global"
               className="stage-pane"
-              variants={VIEW_VARIANTS}
-              initial="initial"
-              animate="animate"
+              variants={STAGE_CONTAINER_VARIANTS}
+              initial="hidden"
+              animate="show"
               exit="exit"
             >
               <GlobalForm
                 key={`global#${rev}`}
                 state={state}
                 focusTarget={settingsTarget}
+                skipEnter={rev !== viewMountedRev}
+                getViewMotion={getViewMotion}
                 onSaved={async (text) => {
                   await refresh();
                   setSettingsTarget((prev) => (prev ? { sec: prev.sec, seq: prev.seq } : null));
