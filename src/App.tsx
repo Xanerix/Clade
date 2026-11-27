@@ -41,6 +41,7 @@ import ProfileForm from "./ProfileForm";
 import CardForm from "./CardForm";
 import GlobalForm from "./GlobalForm";
 import Launcher from "./Launcher";
+import PageBackdrop from "./PageBackdrop";
 
 type TopView = "launch" | "profiles" | "cards" | "global";
 const TOP_VIEW_INDEX: Record<TopView, number> = { launch: 0, profiles: 1, cards: 2, global: 3 };
@@ -667,6 +668,7 @@ export default function App() {
 
       {/* STAGE */}
       <div className="stage">
+        <PageBackdrop view={view} />
         <AnimatePresence mode="wait">
           {view === "launch" && (
             <motion.div
